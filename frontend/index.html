@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Corpus Cabinet</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🗄️</text></svg>">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #ffffff;
+      --bg2:      #f7f7f5;
+      --bg3:      #f0efe9;
+      --text:     #1a1a18;
+      --text2:    #6b6b65;
+      --text3:    #9b9b93;
+      --border:   rgba(0,0,0,0.1);
+      --accent:   #7F77DD;
+      --info-bg:  #E6F1FB;
+      --info-txt: #0C447C;
+      --mono:     'Menlo', 'Consolas', monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg:       #1c1c1a;
+        --bg2:      #242422;
+        --bg3:      #2c2c2a;
+        --text:     #e8e8e2;
+        --text2:    #9b9b93;
+        --text3:    #6b6b65;
+        --border:   rgba(255,255,255,0.1);
+        --info-bg:  #0c2540;
+        --info-txt: #85b7eb;
+      }
+    }
+
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg3); color: var(--text); height: 100vh; display: flex; align-items: stretch; }
+    .app { display: flex; width: 100%; height: 100vh; overflow: hidden; }
+
+    /* ── Sidebar ── */
+    .sidebar { width: 210px; background: var(--bg2); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
+    .sidebar-header { padding: 16px 14px 12px; border-bottom: 1px solid var(--border); }
+    .sidebar-header h1 { font-size: 14px; font-weight: 600; }
+    .sidebar-header p  { font-size: 11px; color: var(--text3); margin-top: 2px; }
+
+    .new-project-btn { margin: 10px 10px 0; padding: 7px 10px; border: 1px dashed var(--border); border-radius: 8px; background: none; color: var(--text2); font-size: 12px; cursor: pointer; width: calc(100% - 20px); text-align: left; }
+    .new-project-btn:hover { background: var(--bg); }
+
+    .sidebar-section { padding: 10px 0 4px; border-top: 1px solid var(--border); margin-top: 8px; }
+    .sidebar-section-label { font-size: 10px; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: 0.5px; padding: 0 14px 4px; }
+
+    .project-item, .tag-filter-item { display: flex; align-items: center; gap: 8px; padding: 6px 14px; cursor: pointer; font-size: 13px; color: var(--text2); border-left: 2px solid transparent; }
+    .project-item:hover, .tag-filter-item:hover { background: var(--bg); color: var(--text); }
+    .project-item.active { color: var(--text); border-left-color: var(--accent); font-weight: 500; background: var(--bg); }
+    .tag-filter-item.active { color: var(--text); font-weight: 500; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .tag-dot { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
+    .count { margin-left: auto; font-size: 11px; color: var(--text3); }
+
+    /* ── Paper list ── */
+    .paper-list { width: 280px; border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; background: var(--bg); }
+    .list-header { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
+    .list-header-top { display: flex; align-items: center; gap: 8px; }
+    .list-header h2 { font-size: 13px; font-weight: 600; flex: 1; }
+    .badge { font-size: 11px; background: var(--bg2); color: var(--text2); padding: 2px 7px; border-radius: 10px; }
+    .search-bar { display: flex; align-items: center; gap: 6px; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 5px 9px; }
+    .search-bar input { border: none; background: transparent; font-size: 12px; color: var(--text); outline: none; flex: 1; font-family: inherit; }
+    .search-bar input::placeholder { color: var(--text3); }
+    .scope-toggle { display: flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .scope-btn { font-size: 11px; padding: 4px 10px; background: none; border: none; cursor: pointer; color: var(--text2); font-family: inherit; }
+    .scope-btn.active { background: var(--bg2); color: var(--text); font-weight: 500; }
+
+    .active-filter { display: none; align-items: center; gap: 6px; font-size: 11px; color: var(--text2); }
+    .active-filter.visible { display: flex; }
+    .filter-chip { padding: 2px 7px; border-radius: 10px; font-weight: 500; font-size: 11px; }
+    .clear-filter { background: none; border: none; cursor: pointer; color: var(--text3); font-size: 11px; margin-left: auto; }
+
+    .drop-zone { margin: 10px 12px; border: 1.5px dashed var(--border); border-radius: 8px; padding: 14px; text-align: center; cursor: pointer; transition: background .15s; }
+    .drop-zone.dragover { background: var(--info-bg); border-color: var(--accent); }
+    .drop-zone p { font-size: 12px; color: var(--text2); }
+    .drop-zone .icon { font-size: 20px; margin-bottom: 4px; }
+
+    .papers { flex: 1; overflow-y: auto; }
+    .paper-card { padding: 10px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
+    .paper-card:hover { background: var(--bg2); }
+    .paper-card.active { background: var(--info-bg); }
+    .paper-title { font-size: 12px; font-weight: 500; line-height: 1.4; margin-bottom: 4px; }
+    .paper-card.active .paper-title { color: var(--info-txt); }
+    .paper-meta { font-size: 11px; color: var(--text3); display: flex; gap: 6px; align-items: center; margin-bottom: 5px; flex-wrap: wrap; }
+    .paper-tag-row { display: flex; gap: 4px; flex-wrap: wrap; }
+    .conf-badge, .tag-chip { font-size: 10px; padding: 1px 6px; border-radius: 4px; font-weight: 500; }
+    .tag-chip { border-radius: 10px; font-weight: 400; }
+
+    /* ── Detail ── */
+    .detail { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
+    .detail-header { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+    .detail-header h2 { font-size: 15px; font-weight: 600; line-height: 1.4; }
+    .detail-header .authors { font-size: 12px; color: var(--text2); margin-top: 4px; }
+    .conf-row { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+    .detail-body { flex: 1; overflow-y: auto; padding: 18px 20px; display: flex; flex-direction: column; gap: 18px; }
+    .section-label { font-size: 10px; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+    .summary-box { font-size: 13px; color: var(--text2); line-height: 1.7; }
+    .bibtex-box { background: var(--bg2); border-radius: 8px; padding: 12px; font-family: var(--mono); font-size: 11px; color: var(--text2); line-height: 1.7; position: relative; white-space: pre-wrap; word-break: break-all; }
+    .copy-btn { position: absolute; top: 8px; right: 8px; font-size: 11px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); cursor: pointer; color: var(--text2); font-family: inherit; }
+    .tag-editor { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .tag-removable { display: flex; align-items: center; gap: 4px; font-size: 12px; padding: 3px 8px; border-radius: 20px; }
+    .tag-removable .remove { cursor: pointer; opacity: 0.6; font-size: 12px; }
+    .tag-removable .remove:hover { opacity: 1; }
+    .add-tag-btn { font-size: 12px; padding: 3px 10px; border-radius: 20px; border: 1px dashed var(--border); background: none; color: var(--text2); cursor: pointer; font-family: inherit; }
+    .tag-input { border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px; font-size: 12px; background: var(--bg); color: var(--text); outline: none; font-family: inherit; width: 130px; }
+    .tag-suggestions { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
+    .tag-suggestion { font-size: 11px; padding: 2px 8px; border-radius: 10px; cursor: pointer; opacity: 0.75; }
+    .tag-suggestion:hover { opacity: 1; }
+    .datasets-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .ds-tag { font-size: 11px; padding: 3px 9px; border-radius: 20px; background: var(--bg2); color: var(--text2); border: 1px solid var(--border); }
+    .empty-state { padding: 30px 20px; text-align: center; font-size: 13px; color: var(--text3); }
+  </style>
+</head>
+<body>
+<div class="app">
+  <div class="sidebar">
+    <div class="sidebar-header"><h1>Corpus <span style="font-weight:300;opacity:0.7">Cabinet</span></h1><p>Reference manager</p></div>
+    <button class="new-project-btn" onclick="promptNewProject()">+ New project</button>
+    <div id="project-list" style="flex:1;overflow-y:auto;padding:8px 0;"></div>
+    <div class="sidebar-section">
+      <div class="sidebar-section-label">Filter by tag</div>
+      <div id="tag-filters"></div>
+    </div>
+  </div>
+
+  <div class="paper-list">
+    <div class="list-header">
+      <div class="list-header-top">
+        <h2 id="list-title">Select a project</h2>
+        <span class="badge" id="paper-count">0 papers</span>
+      </div>
+      <div class="search-bar">
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="6.5" cy="6.5" r="5" stroke="currentColor" stroke-width="1.5" opacity=".5"/><path d="M10.5 10.5L14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" opacity=".5"/></svg>
+        <input id="search-input" type="text" placeholder="Search papers..." oninput="loadPapers()">
+      </div>
+      <div class="scope-toggle">
+        <button class="scope-btn active" id="btn-local" onclick="setScope('local')">This project</button>
+        <button class="scope-btn" id="btn-global" onclick="setScope('global')">All projects</button>
+      </div>
+      <div class="active-filter" id="active-filter">
+        <span style="color:var(--text3)">Tag:</span>
+        <span class="filter-chip" id="filter-chip-label"></span>
+        <button class="clear-filter" onclick="clearTagFilter()">✕ clear</button>
+      </div>
+    </div>
+    <div class="drop-zone" id="drop-zone">
+      <div class="icon">⬆</div>
+      <p id="drop-label">Drop PDF here to add paper</p>
+    </div>
+    <div class="papers" id="paper-list"></div>
+  </div>
+
+  <div class="detail" id="detail-panel">
+    <div class="empty-state" style="margin:auto;">Select a paper to view details</div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
