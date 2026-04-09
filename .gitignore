@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 *.db
 data/
+workspace/
+venv/
+.venv/
+env/

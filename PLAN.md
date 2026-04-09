@@ -164,9 +164,9 @@ Respond ONLY with a JSON object:
 ```
 SERPAPI_KEY=your_serpapi_key_here
 ANTHROPIC_API_KEY=your_anthropic_key_here
-DATABASE_URL=sqlite:///./corpus_cabinet.db
-DATA_DIR=./data/projects
 ```
+
+Workspace locations are managed via the UI (stored in `~/.corpus-cabinet/workspaces.json`).
 
 ---
 
@@ -197,6 +197,18 @@ These are noted so Claude Code doesn't implement them prematurely:
 - **Cluster view**: group papers by topic using embeddings (e.g. sentence-transformers)
 - **Citation graph**: visualize how papers connect via citations
 - **Evaluation table**: sort papers by shared dataset/metric/value across a project
+
+---
+
+## Version 2: Desktop App (Electron)
+
+v1 is a webapp (current). v2 will be an Electron desktop app with:
+- Native OS folder picker dialogs (no manual path typing)
+- Packaged installers for Mac/Windows/Linux
+- Same backend (FastAPI) and database (SQLite)
+- 100% compatible workspace format (can switch between v1 and v2)
+
+See CLAUDE.md for full v2 architecture and migration plan.
 
 ---
 

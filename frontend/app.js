@@ -2,6 +2,8 @@
 let projects      = [];
 let papers        = [];
 let allTags       = [];
+let workspaces    = [];
+let activeWorkspace = null;
 let selectedProj  = null;
 let selectedPaper = null;
 let activeTag     = null;
@@ -11,6 +13,7 @@ const API = '';  // same origin
 
 /* ── Bootstrap ── */
 async function init() {
+  await loadWorkspaces();
   await loadProjects();
   await loadAllTags();
   setupDropZone();
@@ -25,14 +28,96 @@ async function loadProjects() {
   }
 }
 
+let dragSrcProjIdx = null;
+let didDragProj = false;
+
 function renderProjects() {
-  document.getElementById('project-list').innerHTML = projects.map(p => `
-    <div class="project-item ${selectedProj?.id === p.id ? 'active' : ''}" onclick="selectProject(${p.id})">
+  document.getElementById('project-list').innerHTML = projects.map((p, idx) => `
+    <div class="project-item ${selectedProj?.id === p.id ? 'active' : ''}"
+      draggable="true"
+      ondragstart="onProjDragStart(event,${idx})"
+      ondragover="onProjDragOver(event,${idx})"
+      ondragleave="onProjDragLeave(event)"
+      ondrop="onProjDrop(event,${idx})"
+      ondragend="onProjDragEnd()"
+      onclick="if(!didDragProj)selectProject(${p.id})">
       <div class="dot" style="background:${p.color}"></div>
-      <span>${p.name}</span>
+      <span class="project-name" id="proj-name-${p.id}">${p.name}</span>
       <span class="count">${p.paper_count}</span>
+      <button class="rename-btn" onclick="startRenameProject(event,${p.id},'${p.name.replace(/'/g, "\\'")}')" title="Rename">✎</button>
     </div>
   `).join('');
+}
+
+function onProjDragStart(e, idx) {
+  dragSrcProjIdx = idx;
+  didDragProj = false;
+  e.dataTransfer.effectAllowed = 'move';
+  e.currentTarget.classList.add('dragging');
+}
+
+function onProjDragOver(e, idx) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  const half = _dragHalf(e);
+  document.querySelectorAll('.project-item').forEach((el, i) => {
+    el.classList.remove('drag-over-top', 'drag-over-bottom');
+    if (i === idx && i !== dragSrcProjIdx) el.classList.add(`drag-over-${half}`);
+  });
+}
+
+function onProjDragLeave(e) {
+  e.currentTarget.classList.remove('drag-over-top', 'drag-over-bottom');
+}
+
+function onProjDrop(e, targetIdx) {
+  e.preventDefault();
+  const half = _dragHalf(e);
+  document.querySelectorAll('.project-item').forEach(el => el.classList.remove('drag-over-top', 'drag-over-bottom', 'dragging'));
+  if (dragSrcProjIdx === null) return;
+  didDragProj = true;
+  let insertAt = half === 'bottom' ? targetIdx + 1 : targetIdx;
+  if (dragSrcProjIdx < insertAt) insertAt--;
+  if (dragSrcProjIdx === insertAt) { dragSrcProjIdx = null; return; }
+  const [moved] = projects.splice(dragSrcProjIdx, 1);
+  projects.splice(insertAt, 0, moved);
+  dragSrcProjIdx = null;
+  renderProjects();
+  api('PUT', '/projects/reorder', { project_ids: projects.map(p => p.id) });
+}
+
+function onProjDragEnd() {
+  document.querySelectorAll('.project-item').forEach(el => el.classList.remove('drag-over-top', 'drag-over-bottom', 'dragging'));
+  setTimeout(() => { didDragProj = false; }, 0);
+}
+
+async function startRenameProject(e, id, currentName) {
+  e.stopPropagation();
+  const span = document.getElementById(`proj-name-${id}`);
+  if (!span) return;
+  const input = document.createElement('input');
+  input.className = 'rename-input';
+  input.value = currentName;
+  span.replaceWith(input);
+  input.focus();
+  input.select();
+
+  async function save() {
+    const name = input.value.trim();
+    if (name && name !== currentName) {
+      try {
+        await api('PUT', `/projects/${id}`, { name });
+        await loadProjects();
+      } catch (err) {
+        alert(`Rename failed: ${err.message}`);
+        await loadProjects();
+      }
+    } else {
+      await loadProjects();
+    }
+  }
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') save(); if (e.key === 'Escape') loadProjects(); });
+  input.addEventListener('blur', save);
 }
 
 function selectProject(projOrId) {
@@ -76,11 +161,21 @@ async function loadPapers() {
   renderPaperList();
 }
 
+let dragSrcIdx = null;
+let didDrag = false;
+
 function renderPaperList() {
   document.getElementById('paper-count').textContent = `${papers.length} paper${papers.length !== 1 ? 's' : ''}`;
   document.getElementById('paper-list').innerHTML = papers.length
-    ? papers.map(p => `
-      <div class="paper-card ${selectedPaper?.id === p.id ? 'active' : ''}" onclick="selectPaperById(${p.id})">
+    ? papers.map((p, idx) => `
+      <div class="paper-card ${selectedPaper?.id === p.id ? 'active' : ''}"
+        draggable="true"
+        ondragstart="onPaperDragStart(event,${idx})"
+        ondragover="onPaperDragOver(event,${idx})"
+        ondragleave="onPaperDragLeave(event)"
+        ondrop="onPaperDrop(event,${idx})"
+        ondragend="onPaperDragEnd()"
+        onclick="if(!didDrag)selectPaperById(${p.id})">
         <div class="paper-title">${p.title}</div>
         <div class="paper-meta">
           <span>${p.conference || 'Unknown venue'}</span>
@@ -91,6 +186,53 @@ function renderPaperList() {
         </div>
       </div>`).join('')
     : '<div class="empty-state">No papers match.</div>';
+}
+
+function onPaperDragStart(e, idx) {
+  dragSrcIdx = idx;
+  didDrag = false;
+  e.dataTransfer.effectAllowed = 'move';
+  e.currentTarget.classList.add('dragging');
+}
+
+function _dragHalf(e) {
+  const r = e.currentTarget.getBoundingClientRect();
+  return e.clientY < r.top + r.height / 2 ? 'top' : 'bottom';
+}
+
+function onPaperDragOver(e, idx) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  const half = _dragHalf(e);
+  document.querySelectorAll('.paper-card').forEach((el, i) => {
+    el.classList.remove('drag-over-top', 'drag-over-bottom');
+    if (i === idx && i !== dragSrcIdx) el.classList.add(`drag-over-${half}`);
+  });
+}
+
+function onPaperDragLeave(e) {
+  e.currentTarget.classList.remove('drag-over-top', 'drag-over-bottom');
+}
+
+function onPaperDrop(e, targetIdx) {
+  e.preventDefault();
+  const half = _dragHalf(e);
+  document.querySelectorAll('.paper-card').forEach(el => el.classList.remove('drag-over-top', 'drag-over-bottom', 'dragging'));
+  if (dragSrcIdx === null) return;
+  didDrag = true;
+  let insertAt = half === 'bottom' ? targetIdx + 1 : targetIdx;
+  if (dragSrcIdx < insertAt) insertAt--;
+  if (dragSrcIdx === insertAt) { dragSrcIdx = null; return; }
+  const [moved] = papers.splice(dragSrcIdx, 1);
+  papers.splice(insertAt, 0, moved);
+  dragSrcIdx = null;
+  renderPaperList();
+  api('PUT', '/papers/reorder', { paper_ids: papers.map(p => p.id) });
+}
+
+function onPaperDragEnd() {
+  document.querySelectorAll('.paper-card').forEach(el => el.classList.remove('drag-over-top', 'drag-over-bottom', 'dragging'));
+  setTimeout(() => { didDrag = false; }, 0);
 }
 
 function selectPaperById(id) {
@@ -108,14 +250,22 @@ function renderDetail(paper) {
   }
   el.innerHTML = `
     <div class="detail-header">
-      <h2>${paper.title}</h2>
+      <div style="display:flex;align-items:flex-start;gap:8px;">
+        <h2 style="flex:1">${paper.title}</h2>
+        <button class="delete-paper-btn" onclick="deletePaper(${paper.id})" title="Delete paper">🗑</button>
+      </div>
       <div class="authors">${paper.authors || 'Authors unknown'}</div>
       <div class="conf-row">
         ${paper.conference ? `<span class="conf-badge" style="background:#EEEDFE;color:#3C3489">${paper.conference}</span>` : ''}
         ${paper.year ? `<span class="ds-tag">${paper.year}</span>` : ''}
       </div>
     </div>
-    <div class="detail-body">
+    <div class="detail-tabs">
+      <button class="detail-tab active" onclick="switchDetailTab(${paper.id}, 'details', this)">Details</button>
+      <button class="detail-tab" onclick="switchDetailTab(${paper.id}, 'pdf', this)">PDF</button>
+    </div>
+    <iframe class="pdf-viewer" id="pdf-frame-${paper.id}" src="/papers/${paper.id}/pdf" style="display:none"></iframe>
+    <div class="detail-body" id="detail-body-${paper.id}">
       <div>
         <div class="section-label">AI summary</div>
         <div class="summary-box">
@@ -135,7 +285,7 @@ function renderDetail(paper) {
       <div>
         <div class="section-label">BibTeX</div>
         <div class="bibtex-box" id="bibtex-${paper.id}">
-          <button class="copy-btn" onclick="copyBibtex(${paper.id})">Copy</button>${paper.bibtex || 'BibTeX not available'}
+          <button class="copy-btn" onclick="copyBibtex(${paper.id})">Copy</button><pre>${paper.bibtex || 'BibTeX not available'}</pre>
         </div>
       </div>
       ${paper.datasets?.length ? `
@@ -149,6 +299,16 @@ function renderDetail(paper) {
     </div>`;
 
   renderTagEditor(paper);
+}
+
+async function deletePaper(paperId) {
+  if (!confirm('Delete this paper? This cannot be undone.')) return;
+  await api('DELETE', `/papers/${paperId}`);
+  papers = papers.filter(p => p.id !== paperId);
+  selectedPaper = null;
+  renderPaperList();
+  renderDetail(null);
+  await loadProjects(); // Update paper counts
 }
 
 /* ── Tags ── */
@@ -261,6 +421,22 @@ async function removeTag(paperId, tagName) {
   await loadPapers();
 }
 
+/* ── Detail tabs ── */
+function switchDetailTab(paperId, tab, btn) {
+  const body = document.getElementById(`detail-body-${paperId}`);
+  const frame = document.getElementById(`pdf-frame-${paperId}`);
+  const tabs = btn.closest('.detail-tabs').querySelectorAll('.detail-tab');
+  tabs.forEach(t => t.classList.remove('active'));
+  btn.classList.add('active');
+  if (tab === 'pdf') {
+    body.style.display = 'none';
+    frame.style.display = 'block';
+  } else {
+    body.style.display = '';
+    frame.style.display = 'none';
+  }
+}
+
 /* ── BibTeX copy ── */
 function copyBibtex(paperId) {
   const paper = papers.find(p => p.id === paperId);
@@ -295,8 +471,10 @@ function setupDropZone() {
 }
 
 async function uploadPdf(file) {
-  const label = document.getElementById('drop-label');
-  label.textContent = `Processing ${file.name}...`;
+  const overlay = document.getElementById('processing-overlay');
+  const overlayLabel = document.getElementById('processing-label');
+  overlayLabel.textContent = `Processing ${file.name}…`;
+  overlay.classList.add('visible');
 
   const form = new FormData();
   form.append('file', file);
@@ -314,9 +492,171 @@ async function uploadPdf(file) {
   } catch (err) {
     alert(`Upload failed: ${err.message}`);
   } finally {
-    label.textContent = 'Drop PDF here to add paper';
+    overlay.classList.remove('visible');
   }
 }
+
+/* ── Workspaces ── */
+async function loadWorkspaces() {
+  try {
+    const data = await api('GET', '/workspaces');
+    workspaces = data.workspaces;
+    activeWorkspace = workspaces.find(w => w.is_active);
+
+    // Update selector display
+    if (activeWorkspace) {
+      document.getElementById('workspace-name').textContent = activeWorkspace.name;
+      document.getElementById('workspace-color').style.background = activeWorkspace.color;
+    }
+  } catch (err) {
+    console.error('Failed to load workspaces:', err);
+  }
+}
+
+async function openWorkspaceSettings() {
+  document.getElementById('workspace-modal').classList.add('visible');
+  await loadWorkspaces(); // Refresh list
+  renderWorkspaceList();
+}
+
+function closeWorkspaceSettings() {
+  document.getElementById('workspace-modal').classList.remove('visible');
+  document.getElementById('new-workspace-name').value = '';
+  document.getElementById('new-workspace-path').value = '';
+}
+
+function closeWorkspaceSettingsIfBackdrop(event) {
+  if (event.target.id === 'workspace-modal') closeWorkspaceSettings();
+}
+
+function renderWorkspaceList() {
+  const container = document.getElementById('workspace-list');
+  container.innerHTML = workspaces.map(w => `
+    <div class="workspace-item ${w.is_active ? 'active' : ''}">
+      <div class="workspace-item-dot" style="background:${w.color}"></div>
+      <div class="workspace-item-info" id="ws-info-${btoa(w.path).replace(/=/g,'')}">
+        <div class="workspace-item-name">${w.name}</div>
+        <div class="workspace-item-path">${w.path}</div>
+      </div>
+      <button class="workspace-item-btn" onclick="startRenameWorkspace('${w.path}','${w.name.replace(/'/g, "\\'")}')">Rename</button>
+      ${w.is_active
+        ? '<span style="font-size:11px;color:var(--accent)">● Active</span>'
+        : `<button class="workspace-item-btn" onclick="switchWorkspace('${w.path}')">Switch</button>`
+      }
+      ${workspaces.length > 1 && !w.is_active
+        ? `<button class="workspace-item-btn danger" onclick="deleteWorkspace('${w.path}')">Remove</button>`
+        : ''
+      }
+    </div>
+  `).join('');
+}
+
+async function startRenameWorkspace(path, currentName) {
+  const newName = prompt('Rename workspace:', currentName);
+  if (!newName || newName.trim() === currentName) return;
+  try {
+    const encodedPath = encodeURIComponent(path);
+    await api('PUT', `/workspaces/${encodedPath}`, { name: newName.trim() });
+    await loadWorkspaces();
+    renderWorkspaceList();
+  } catch (err) {
+    alert(`Rename failed: ${err.message}`);
+  }
+}
+
+let pendingWorkspace = null;
+
+async function createNewWorkspace() {
+  const name = document.getElementById('new-workspace-name').value.trim();
+  const path = document.getElementById('new-workspace-path').value.trim();
+
+  if (!name || !path) {
+    alert('Please enter both a name and path for the workspace');
+    return;
+  }
+
+  try {
+    // Check if path exists
+    const check = await api('POST', '/workspaces/check-path', { name, path });
+
+    if (check.needs_creation) {
+      // Show confirmation dialog
+      pendingWorkspace = { name, path };
+      showConfirmDialog(
+        'Create Workspace Folder?',
+        `This folder doesn't exist yet. Corpus Cabinet will create it for you:`,
+        check.path
+      );
+    } else if (check.exists && !check.is_directory) {
+      alert('This path exists but is not a directory. Please choose a different location.');
+    } else {
+      // Path exists and is a directory, create workspace directly
+      await doCreateWorkspace(name, path);
+    }
+  } catch (err) {
+    alert(`Failed to check path: ${err.message}`);
+  }
+}
+
+async function doCreateWorkspace(name, path) {
+  try {
+    await api('POST', '/workspaces', { name, path });
+    await loadWorkspaces();
+    renderWorkspaceList();
+    document.getElementById('new-workspace-name').value = '';
+    document.getElementById('new-workspace-path').value = '';
+    alert(`Workspace "${name}" created! You can now switch to it.`);
+  } catch (err) {
+    alert(`Failed to create workspace: ${err.message}`);
+  }
+}
+
+function showConfirmDialog(title, message, path) {
+  document.getElementById('confirm-title').textContent = title;
+  document.getElementById('confirm-message').textContent = message;
+  document.getElementById('confirm-path').textContent = path;
+  document.getElementById('confirm-dialog').classList.add('visible');
+}
+
+function closeConfirmDialog(event) {
+  if (!event || event.target.id === 'confirm-dialog') {
+    document.getElementById('confirm-dialog').classList.remove('visible');
+    pendingWorkspace = null;
+  }
+}
+
+function confirmAction() {
+  if (pendingWorkspace) {
+    closeConfirmDialog();
+    doCreateWorkspace(pendingWorkspace.name, pendingWorkspace.path);
+  }
+}
+
+async function switchWorkspace(path) {
+  if (!confirm('Switch workspace? The page will reload.')) return;
+
+  try {
+    const encodedPath = encodeURIComponent(path);
+    await api('POST', `/workspaces/${encodedPath}/activate`, {});
+    window.location.reload();
+  } catch (err) {
+    alert(`Failed to switch workspace: ${err.message}`);
+  }
+}
+
+async function deleteWorkspace(path) {
+  if (!confirm('Remove this workspace from the list? (Files will not be deleted)')) return;
+
+  try {
+    const encodedPath = encodeURIComponent(path);
+    await fetch(`${API}/workspaces/${encodedPath}`, { method: 'DELETE' });
+    await loadWorkspaces();
+    renderWorkspaceList();
+  } catch (err) {
+    alert(`Failed to remove workspace: ${err.message}`);
+  }
+}
+
 
 /* ── API helper ── */
 async function api(method, path, body = null) {

@@ -18,6 +18,7 @@ class Project(Base):
     name        = Column(String, unique=True, nullable=False)
     color       = Column(String, default="#7F77DD")        # sidebar dot color
     folder_path = Column(String, nullable=False)
+    position    = Column(Integer, nullable=True)
     created_at  = Column(DateTime, default=datetime.utcnow)
 
     papers = relationship("Paper", back_populates="project", cascade="all, delete-orphan")
@@ -40,6 +41,7 @@ class Paper(Base):
     metrics     = Column(Text, default="")           # comma-separated metric names
     file_path   = Column(String, nullable=False)
     scholar_id  = Column(String, default="")         # SerpAPI result_id for re-fetching
+    position    = Column(Integer, nullable=True)     # manual sort order within project
     created_at  = Column(DateTime, default=datetime.utcnow)
 
     project = relationship("Project", back_populates="papers")

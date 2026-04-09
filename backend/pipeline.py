@@ -1,5 +1,5 @@
 import os
-import shutil
+import re
 import json
 import fitz  # PyMuPDF
 import anthropic
@@ -27,24 +27,38 @@ Respond ONLY with a valid JSON object, no markdown, no preamble:
   "metrics": ["..."]
 }"""
 
+METADATA_PROMPT = """Extract the title and authors from this academic paper's first page.
 
-def extract_title(pdf_path: str) -> str:
-    """
-    Extract the paper title from a PDF.
-    Strategy: find the largest font text on the first page.
-    Falls back to the first non-empty line of text.
-    """
+Rules:
+- Title: the full paper title only (not the venue, journal, or arXiv ID)
+- Authors: in BibTeX format — "Last, First and Last, First" (e.g. "Wang, Ziyang and Yu, Shoubin and Stengel-Eskin, Elias")
+- If you cannot find the authors, return an empty string for authors
+
+Respond ONLY with a valid JSON object, no markdown, no preamble:
+{
+  "title": "...",
+  "authors": "..."
+}"""
+
+
+def extract_first_page_text(pdf_path: str) -> str:
+    """Extract plain text from the first page of a PDF."""
+    doc = fitz.open(pdf_path)
+    text = doc[0].get_text("text").strip()
+    doc.close()
+    return text
+
+
+def _extract_title_fallback(pdf_path: str) -> str:
+    """Fallback title extraction: largest font span on page 0."""
     doc = fitz.open(pdf_path)
     page = doc[0]
-
-    # Get all text blocks with font size info
     blocks = page.get_text("dict")["blocks"]
-    best_text = ""
-    best_size = 0
-
+    best_text, best_size = "", 0
     for block in blocks:
-        if block.get("type") != 0:  # 0 = text block
+        if block.get("type") != 0:
             continue
+        
         for line in block.get("lines", []):
             for span in line.get("spans", []):
                 size = span.get("size", 0)
@@ -52,14 +66,45 @@ def extract_title(pdf_path: str) -> str:
                 if text and size > best_size:
                     best_size = size
                     best_text = text
-
-    # Fallback: first line of plain text
     if not best_text:
         plain = page.get_text("text").strip()
         best_text = plain.split("\n")[0].strip() if plain else "Unknown Title"
-
     doc.close()
     return best_text
+
+
+def extract_metadata_with_haiku(pdf_path: str) -> dict:
+    """
+    Use Claude Haiku to extract title and full author names from the PDF first page.
+    Returns dict with keys: title, authors.
+    """
+    first_page = extract_first_page_text(pdf_path)
+
+    try:
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            messages=[{
+                "role": "user",
+                "content": f"{METADATA_PROMPT}\n\n--- FIRST PAGE ---\n{first_page[:3000]}"
+            }]
+        )
+        raw = message.content[0].text.strip()
+        print(f"[pipeline] Haiku raw response: {raw[:200]}")
+
+        # Strip markdown code fences if Haiku wrapped the JSON
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw).strip()
+
+        data = json.loads(raw)
+        print(f"[pipeline] Haiku extracted title: {data.get('title', '')}")
+        print(f"[pipeline] Haiku extracted authors: {data.get('authors', '')}")
+        return data
+    except Exception as e:
+        print(f"[pipeline] extract_metadata_with_haiku failed: {e}")
+        # Fallback: extract title from largest font span on first page
+        return {"title": _extract_title_fallback(pdf_path), "authors": ""}
 
 
 def extract_text(pdf_path: str, max_chars: int = 8000) -> str:
@@ -112,14 +157,31 @@ def process_pdf(
     3. Extract text + call Claude for summary
     4. Save Paper to DB
     """
-    # 1. Extract title
-    title = extract_title(pdf_path)
-    print(f"[pipeline] Extracted title: {title}")
+    # 1. Use Haiku to extract title + full authors from PDF
+    print(f"[pipeline] Extracting metadata with Haiku...")
+    pdf_meta = extract_metadata_with_haiku(pdf_path)
+    pdf_title   = pdf_meta.get("title", "").strip()
+    pdf_authors = pdf_meta.get("authors", "").strip()
 
-    # 2. Scholar metadata + BibTeX
-    print(f"[pipeline] Searching Scholar for: {title}")
-    meta = get_paper_metadata(title)
-    print(f"[pipeline] Got metadata: conference={meta['conference']}, year={meta['year']}")
+    # If Haiku returned no title, fall back to font-size heuristic
+    if not pdf_title:
+        pdf_title = _extract_title_fallback(pdf_path)
+        print(f"[pipeline] Using fallback title: {pdf_title}")
+
+    # 2. Scholar metadata + BibTeX (pass Haiku authors for BibTeX construction)
+    print(f"[pipeline] Searching Scholar for: {pdf_title}")
+    meta = get_paper_metadata(pdf_title, pdf_authors=pdf_authors)
+
+    # Prefer Scholar's title (canonical), fall back to Haiku's
+    final_title   = meta.get("title") or pdf_title
+    final_authors = pdf_authors or meta.get("authors", "")
+
+    print(f"[pipeline] Title: {final_title}")
+    print(f"[pipeline] Authors: {final_authors}")
+    if meta['bibtex']:
+        print(f"[pipeline] BibTeX ✓  conference={meta['conference']}, year={meta['year']}")
+    else:
+        print(f"[pipeline] BibTeX ✗  conference={meta['conference']}, year={meta['year']}")
 
     # 3. AI summary
     print(f"[pipeline] Summarizing paper...")
@@ -132,8 +194,8 @@ def process_pdf(
     # 4. Save to DB
     paper = Paper(
         project_id  = project.id,
-        title       = title,
-        authors     = meta["authors"],
+        title       = final_title,
+        authors     = final_authors,
         conference  = meta["conference"],
         year        = meta["year"],
         bibtex      = meta["bibtex"],

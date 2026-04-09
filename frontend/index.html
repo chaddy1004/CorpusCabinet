@@ -44,6 +44,13 @@
     .sidebar-header h1 { font-size: 14px; font-weight: 600; }
     .sidebar-header p  { font-size: 11px; color: var(--text3); margin-top: 2px; }
 
+    /* Workspace selector */
+    .workspace-selector { padding: 10px; border-bottom: 1px solid var(--border); }
+    .workspace-dropdown { width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 12px; cursor: pointer; font-family: inherit; display: flex; align-items: center; gap: 6px; }
+    .workspace-dropdown:hover { background: var(--bg3); }
+    .workspace-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .workspace-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
     .new-project-btn { margin: 10px 10px 0; padding: 7px 10px; border: 1px dashed var(--border); border-radius: 8px; background: none; color: var(--text2); font-size: 12px; cursor: pointer; width: calc(100% - 20px); text-align: left; }
     .new-project-btn:hover { background: var(--bg); }
 
@@ -53,6 +60,13 @@
     .project-item, .tag-filter-item { display: flex; align-items: center; gap: 8px; padding: 6px 14px; cursor: pointer; font-size: 13px; color: var(--text2); border-left: 2px solid transparent; }
     .project-item:hover, .tag-filter-item:hover { background: var(--bg); color: var(--text); }
     .project-item.active { color: var(--text); border-left-color: var(--accent); font-weight: 500; background: var(--bg); }
+    .project-item.dragging { opacity: 0.4; }
+    .project-item.drag-over-top { border-top: 2px solid var(--accent); }
+    .project-item.drag-over-bottom { border-bottom: 2px solid var(--accent); }
+    .project-name { flex: 1; }
+    .rename-btn { display: none; background: none; border: none; cursor: pointer; color: var(--text3); font-size: 13px; padding: 0 2px; line-height: 1; }
+    .project-item:hover .rename-btn { display: block; }
+    .rename-input { flex: 1; font-size: 13px; font-family: inherit; background: var(--bg2); border: 1px solid var(--accent); border-radius: 4px; padding: 1px 6px; color: var(--text); outline: none; }
     .tag-filter-item.active { color: var(--text); font-weight: 500; }
     .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
     .tag-dot { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
@@ -85,6 +99,9 @@
     .paper-card { padding: 10px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
     .paper-card:hover { background: var(--bg2); }
     .paper-card.active { background: var(--info-bg); }
+    .paper-card.dragging { opacity: 0.4; }
+    .paper-card.drag-over-top { border-top: 2px solid var(--accent); }
+    .paper-card.drag-over-bottom { border-bottom: 2px solid var(--accent); }
     .paper-title { font-size: 12px; font-weight: 500; line-height: 1.4; margin-bottom: 4px; }
     .paper-card.active .paper-title { color: var(--info-txt); }
     .paper-meta { font-size: 11px; color: var(--text3); display: flex; gap: 6px; align-items: center; margin-bottom: 5px; flex-wrap: wrap; }
@@ -95,13 +112,20 @@
     /* ── Detail ── */
     .detail { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
     .detail-header { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+    .delete-paper-btn { background: none; border: none; cursor: pointer; font-size: 15px; opacity: 0.35; padding: 2px; flex-shrink: 0; }
+    .delete-paper-btn:hover { opacity: 1; }
     .detail-header h2 { font-size: 15px; font-weight: 600; line-height: 1.4; }
     .detail-header .authors { font-size: 12px; color: var(--text2); margin-top: 4px; }
     .conf-row { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+    .detail-tabs { display: flex; gap: 2px; padding: 0 20px 0; border-bottom: 1px solid var(--border); }
+    .detail-tab { padding: 8px 14px; font-size: 12px; font-weight: 500; color: var(--text3); cursor: pointer; border: none; background: none; font-family: inherit; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+    .detail-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
     .detail-body { flex: 1; overflow-y: auto; padding: 18px 20px; display: flex; flex-direction: column; gap: 18px; }
+    .pdf-viewer { flex: 1; border: none; width: 100%; }
     .section-label { font-size: 10px; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
     .summary-box { font-size: 13px; color: var(--text2); line-height: 1.7; }
-    .bibtex-box { background: var(--bg2); border-radius: 8px; padding: 12px; font-family: var(--mono); font-size: 11px; color: var(--text2); line-height: 1.7; position: relative; white-space: pre-wrap; word-break: break-all; }
+    .bibtex-box { background: var(--bg2); border-radius: 8px; padding: 12px; font-family: var(--mono); font-size: 11px; color: var(--text2); line-height: 1.7; position: relative; }
+    .bibtex-box pre { margin: 0; font-family: inherit; font-size: inherit; color: inherit; line-height: inherit; white-space: pre-wrap; word-break: break-all; }
     .copy-btn { position: absolute; top: 8px; right: 8px; font-size: 11px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); cursor: pointer; color: var(--text2); font-family: inherit; }
     .tag-editor { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
     .tag-removable { display: flex; align-items: center; gap: 4px; font-size: 12px; padding: 3px 8px; border-radius: 20px; }
@@ -115,12 +139,75 @@
     .datasets-row { display: flex; flex-wrap: wrap; gap: 6px; }
     .ds-tag { font-size: 11px; padding: 3px 9px; border-radius: 20px; background: var(--bg2); color: var(--text2); border: 1px solid var(--border); }
     .empty-state { padding: 30px 20px; text-align: center; font-size: 13px; color: var(--text3); }
+
+    .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); display: none; align-items: center; justify-content: center; z-index: 1000; }
+    .modal-overlay.visible { display: flex; }
+    .modal { background: var(--bg); border-radius: 12px; width: 90%; max-width: 500px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+    .modal-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+    .modal-header h3 { font-size: 15px; font-weight: 600; }
+    .modal-close { background: none; border: none; font-size: 18px; cursor: pointer; color: var(--text3); padding: 0; width: 24px; height: 24px; }
+    .modal-close:hover { color: var(--text); }
+    .modal-body { padding: 20px; }
+    .setting-row { margin-bottom: 18px; }
+    .setting-row:last-child { margin-bottom: 0; }
+    .setting-row label { display: block; font-size: 12px; font-weight: 600; color: var(--text2); margin-bottom: 6px; }
+    .setting-row input { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg2); color: var(--text); font-size: 13px; font-family: var(--mono); }
+    .setting-row input:focus { outline: 2px solid var(--accent); outline-offset: 0; }
+    .setting-info { font-size: 11px; color: var(--text3); margin-top: 4px; line-height: 1.5; }
+    .workspace-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+    .stat-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; }
+    .stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text3); margin-bottom: 4px; }
+    .stat-value { font-size: 16px; font-weight: 600; color: var(--text); }
+    .save-btn { background: var(--accent); color: white; border: none; padding: 8px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; font-weight: 500; font-family: inherit; width: 100%; margin-top: 12px; }
+    .save-btn:hover { opacity: 0.9; }
+    .instructions { background: var(--info-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-top: 12px; }
+    .instructions-title { font-size: 12px; font-weight: 600; color: var(--info-txt); margin-bottom: 6px; }
+    .instructions ol { margin-left: 18px; font-size: 12px; color: var(--info-txt); line-height: 1.7; }
+
+    /* Workspace list */
+    .workspace-item { display: flex; align-items: center; gap: 10px; padding: 10px; background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; }
+    .workspace-item.active { border-color: var(--accent); background: var(--info-bg); }
+    .workspace-item-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .workspace-item-info { flex: 1; }
+    .workspace-item-name { font-size: 13px; font-weight: 500; color: var(--text); }
+    .workspace-item-path { font-size: 10px; color: var(--text3); font-family: var(--mono); margin-top: 2px; }
+    .workspace-item-btn { font-size: 11px; padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); cursor: pointer; color: var(--text2); font-family: inherit; }
+    .workspace-item-btn:hover { background: var(--bg3); }
+    .workspace-item-btn.danger { color: #d85a30; border-color: #d85a30; }
+    .workspace-item-btn.danger:hover { background: #d85a3010; }
+
+    /* Confirmation dialog */
+    .confirm-dialog { background: var(--bg); border-radius: 12px; width: 90%; max-width: 450px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); padding: 20px; }
+    .confirm-dialog h4 { font-size: 14px; font-weight: 600; margin-bottom: 12px; color: var(--text); }
+    .confirm-dialog p { font-size: 13px; line-height: 1.6; color: var(--text2); margin-bottom: 16px; }
+    .confirm-dialog .path-preview { background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-family: var(--mono); font-size: 11px; color: var(--text); margin-bottom: 16px; word-break: break-all; }
+    .confirm-dialog .button-row { display: flex; gap: 10px; }
+    .confirm-dialog button { flex: 1; padding: 8px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; font-weight: 500; font-family: inherit; border: 1px solid var(--border); }
+    .confirm-dialog .btn-cancel { background: var(--bg2); color: var(--text2); }
+    .confirm-dialog .btn-cancel:hover { background: var(--bg3); }
+    .confirm-dialog .btn-confirm { background: var(--accent); color: white; border-color: var(--accent); }
+    .confirm-dialog .btn-confirm:hover { opacity: 0.9; }
+
+    /* Processing overlay */
+    .processing-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 200; flex-direction: column; align-items: center; justify-content: center; gap: 16px; backdrop-filter: blur(4px); }
+    .processing-overlay.visible { display: flex; }
+    .processing-overlay video { width: 180px; height: 180px; object-fit: contain; border-radius: 16px; }
+    .processing-overlay p { color: rgba(255,255,255,0.85); font-size: 13px; font-family: var(--mono); letter-spacing: 0.3px; }
   </style>
 </head>
 <body>
 <div class="app">
   <div class="sidebar">
     <div class="sidebar-header"><h1>Corpus <span style="font-weight:300;opacity:0.7">Cabinet</span></h1><p>Reference manager</p></div>
+
+    <div class="workspace-selector">
+      <button class="workspace-dropdown" id="workspace-selector" onclick="openWorkspaceSettings()">
+        <div class="workspace-dot" id="workspace-color"></div>
+        <span class="workspace-name" id="workspace-name">Loading...</span>
+        <span style="margin-left:auto;opacity:0.5">⌄</span>
+      </button>
+    </div>
+
     <button class="new-project-btn" onclick="promptNewProject()">+ New project</button>
     <div id="project-list" style="flex:1;overflow-y:auto;padding:8px 0;"></div>
     <div class="sidebar-section">
@@ -159,6 +246,49 @@
   <div class="detail" id="detail-panel">
     <div class="empty-state" style="margin:auto;">Select a paper to view details</div>
   </div>
+</div>
+
+<!-- Workspace Settings Modal -->
+<div class="modal-overlay" id="workspace-modal" onclick="closeWorkspaceSettingsIfBackdrop(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h3>Workspaces</h3>
+      <button class="modal-close" onclick="closeWorkspaceSettings()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="setting-row">
+        <label>Your Workspaces</label>
+        <div id="workspace-list" style="display:flex;flex-direction:column;gap:8px;margin-top:8px;"></div>
+      </div>
+
+      <div class="setting-row" style="margin-top:20px;">
+        <label>Add New Workspace</label>
+        <input type="text" id="new-workspace-name" placeholder="e.g., Research Papers" style="margin-bottom:8px;">
+        <input type="text" id="new-workspace-path" placeholder="/Users/yourname/Documents/MyPapers">
+        <div class="setting-info">Enter a path where you want to store PDFs and database</div>
+        <button class="save-btn" onclick="createNewWorkspace()">+ Create Workspace</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Confirmation Dialog -->
+<div class="modal-overlay" id="confirm-dialog" onclick="closeConfirmDialog(event)">
+  <div class="confirm-dialog" onclick="event.stopPropagation()">
+    <h4 id="confirm-title">Create Workspace Folder?</h4>
+    <p id="confirm-message"></p>
+    <div class="path-preview" id="confirm-path"></div>
+    <div class="button-row">
+      <button class="btn-cancel" onclick="closeConfirmDialog()">Cancel</button>
+      <button class="btn-confirm" id="confirm-btn" onclick="confirmAction()">Create</button>
+    </div>
+  </div>
+</div>
+
+
+<div class="processing-overlay" id="processing-overlay">
+  <video src="/static/folder.mp4" autoplay loop muted playsinline></video>
+  <p id="processing-label">Processing paper...</p>
 </div>
 
 <script src="/static/app.js"></script>

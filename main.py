@@ -3,8 +3,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.database import init_db
-from backend.routes import projects, papers, tags
+from backend.database import init_workspace
+from backend.workspace_config import get_workspace_config
+from backend.routes import projects, papers, tags, workspaces
 
 app = FastAPI(title="Corpus Cabinet")
 
@@ -16,6 +17,7 @@ app.add_middleware(
 )
 
 # Register routes
+app.include_router(workspaces.router)
 app.include_router(projects.router)
 app.include_router(papers.router)
 app.include_router(tags.router)
@@ -29,5 +31,13 @@ def root():
 
 @app.on_event("startup")
 def startup():
-    init_db()
-    print("Corpus Cabinet started — DB initialized")
+    # Load workspace config and initialize the active workspace
+    config = get_workspace_config()
+    active_ws = config.get_active_workspace()
+
+    if active_ws:
+        init_workspace(active_ws.path)
+        print(f"Corpus Cabinet started")
+        print(f"Active workspace: {active_ws.name} ({active_ws.path})")
+    else:
+        print("WARNING: No active workspace configured")

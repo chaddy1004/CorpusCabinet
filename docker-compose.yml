@@ -5,6 +5,9 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      - WORKSPACE_DIR=/workspace
     volumes:
-      - ./data:/app/data
-      - ./corpus_cabinet.db:/app/corpus_cabinet.db
+      # Mount your workspace directory - contains database + PDFs
+      # Configure HOST_WORKSPACE_DIR in .env (defaults to ./workspace)
+      - ${HOST_WORKSPACE_DIR:-./workspace}:/workspace
