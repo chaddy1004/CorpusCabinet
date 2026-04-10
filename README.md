@@ -4,6 +4,8 @@ A personal academic reference manager. Drop a PDF — it automatically extracts 
 
 Think Zotero, but with proper conference BibTeX, AI-generated summaries, and a clean three-panel UI.
 
+![Corpus Cabinet main page](readme-assets/main-page.png)
+
 ---
 
 ## Features
@@ -81,6 +83,24 @@ Open [http://localhost:8000](http://localhost:8000).
 
 ## How to use
 
+### Creating a workspace
+
+A workspace is a self-contained folder that holds your entire database and all uploaded PDFs. You can have multiple workspaces — for example, one per research area or one shared with a team.
+
+To set your workspace path, open **Settings** (bottom of the sidebar) and enter a directory path. Corpus Cabinet will create the folder if it doesn't exist and initialise a fresh database inside it.
+
+![Workspace settings](readme-assets/workspace-setting.png)
+
+The workspace folder structure:
+
+```
+your-workspace/
+├── corpus_cabinet.db      ← all metadata, tags, and paper records
+└── projects/
+    └── {project_name}/
+        └── paper.pdf      ← original uploaded PDFs
+```
+
 ### Creating a project
 
 Click **+ New project** in the sidebar and enter a name. Projects are colour-coded for easy identification.
@@ -118,20 +138,6 @@ Use the search bar at the top of the middle panel to filter by title. Use the **
 ### Copying BibTeX
 
 Open a paper, scroll to the BibTeX section, and click **Copy**. The full BibTeX entry is copied to your clipboard.
-
----
-
-## Data storage
-
-```
-workspace/
-├── corpus_cabinet.db      ← all metadata, tags, and paper records
-└── projects/
-    └── {project_name}/
-        └── paper.pdf      ← original uploaded PDFs
-```
-
-The `workspace/` directory is excluded from version control. Back it up separately if you care about your data.
 
 ---
 
