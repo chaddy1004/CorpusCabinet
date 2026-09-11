@@ -1,167 +1,128 @@
 # Corpus Cabinet
 
-A no-nonsense personal academic reference manager built to fit one specific workflow: download a paper, drop it in, and immediately have everything you need — the right BibTeX, the conference it was published at, and a concise AI summary of what the paper actually does.
+Corpus Cabinet is a native desktop academic reference manager for macOS,
+Windows, and Linux. It is designed around a local library of papers: choose a
+library folder, organize papers into projects, and read PDFs without a browser
+or local web server.
 
-Built because existing tools like Zotero get the job half done. Zotero gives you arXiv links instead of conference BibTeX. It doesn't tell you what the paper's methodology is. It doesn't organise papers the way a researcher actually thinks about them. Corpus Cabinet does.
+## Current MVP
 
-![Corpus Cabinet main page](readme-assets/main-page.png)
+- Native PySide6/Qt desktop window
+- Local library and workspace persistence
+- Project creation, renaming, deletion, and paper counts
+- Multi-PDF import with safe copied filenames
+- Title and author metadata extraction from PDFs
+- Bounded extracted text stored for future AI assistance
+- Search by paper title or authors
+- In-app PDF viewing
+- Native confirmation dialogs and background PDF importing
+- Online title search through Crossref, arXiv, and OpenAlex
+- User-controlled Offline Mode that keeps all local features available
+- Confirmed metadata application and citation-only paper records
+- Background download and import of direct open-access PDF links
+- Google Scholar browser handoff for manual Scholar searching
+- A provider-independent `AssistantEngine` foundation for future paper chat
 
----
+The AI reading assistant, retrieval from sources without a direct open-access
+PDF, tagging, citation management, and synchronization are planned follow-up
+milestones. The old FastAPI/browser
+prototype remains in the repository as reference code but is not the desktop
+launch path.
 
-## Why I built this
+## Run locally
 
-These were the pain points:
-
-- **Zotero's BibTeX is wrong for ML papers.** It links to the arXiv preprint, not the conference publication. If your paper was published at CVPR 2023, you want a `@inproceedings` entry with the correct venue — not an arXiv URL your advisor will flag in review.
-- **No quick summary.** Opening a paper to remember what it does breaks flow. I wanted a two-sentence answer to "what does this paper do and how?" without reopening the PDF.
-- **Projects don't map to how I think.** I read papers in clusters — by topic, by related works section, by reading list for a specific experiment. I wanted project folders that mirror that, each with its own isolated set of papers.
-- **Drag and drop should just work.** Drop a PDF, done. Everything else is automated.
-
-The goal was a simple, fast, local app that fits into a research workflow without getting in the way.
-
----
-
-## Features
-
-- **Proper conference BibTeX** — fetched from Google Scholar via SerpAPI, not arXiv. Gets the actual `@inproceedings` entry with venue, year, and pages.
-- **AI summaries** — Claude reads the paper and extracts: what task it addresses, what the core methodology is, which datasets were used, and which metrics were evaluated.
-- **Drag-and-drop upload** — drop a PDF onto the app. It extracts the title, queries Scholar, runs the AI summary, and saves everything. No forms to fill.
-- **Projects** — organise papers into named, colour-coded projects (like reading lists or related-works groups). Each project gets its own folder on disk.
-- **Tags** — add freeform tags to papers and filter by them in the sidebar.
-- **Search** — search by title within a project or across all projects.
-- **One-click BibTeX copy** — open a paper, click Copy. Paste into your `.bib` file.
-- **Dark mode** — follows your system preference.
-
----
-
-## Planned
-
-- **Cluster view** — after building up a project, automatically group papers by topic using embeddings. The goal is to have a "related works radar" — see which papers cluster together so you can structure a literature review without manually sorting.
-
----
-
-## Stack
-
-| Layer | Technology |
-|---|---|
-| Backend framework | FastAPI |
-| Server | Uvicorn |
-| Database | SQLite via SQLAlchemy |
-| PDF parsing | PyMuPDF |
-| Scholar metadata | SerpAPI |
-| AI summaries | Anthropic Claude API |
-| Frontend | Vanilla JS + HTML/CSS (no build step) |
-
----
-
-## Setup
-
-### Prerequisites
-
-- Docker + Docker Compose, **or** Python 3.11+
-- A [SerpAPI](https://serpapi.com) key (free tier: 100 searches/month)
-- An [Anthropic](https://console.anthropic.com) API key
-
-### 1. Clone and configure
+Requirements: Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone https://github.com/your-username/CorpusCabinet.git
-cd CorpusCabinet
-cp .env.example .env
+uv sync
+uv run run_desktop.py
 ```
 
-Edit `.env` and fill in your API keys:
-
-```env
-SERPAPI_KEY=your_serpapi_key_here
-ANTHROPIC_API_KEY=your_anthropic_key_here
-```
-
-### 2. Run with Docker (recommended)
+The equivalent installed command is:
 
 ```bash
-docker compose up --build
+uv run corpus-cabinet
 ```
 
-Open [http://localhost:8000](http://localhost:8000).
-
-Your database and PDFs are stored in `./workspace/` on your host machine and persist across container restarts.
-
-### 3. Run locally (without Docker)
+Set `WORKSPACE_DIR` when developing against a specific library folder:
 
 ```bash
-python -m venv venv
-source venv/bin/activate      # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn main:app --reload
+WORKSPACE_DIR=/path/to/library uv run run_desktop.py
 ```
 
-Open [http://localhost:8000](http://localhost:8000).
+Optionally set `CROSSREF_MAILTO` to identify requests to Crossref politely:
 
----
-
-## How to use
-
-### Creating a workspace
-
-A workspace is a self-contained folder that holds your entire database and all uploaded PDFs. You can point Corpus Cabinet at any folder on your machine — useful for keeping a work workspace separate from a personal one, or for backing up to a cloud-synced folder like Dropbox.
-
-To set your workspace path, open **Settings** (bottom of the sidebar) and enter a directory path. Corpus Cabinet will create the folder if it doesn't exist and initialise a fresh database inside it.
-
-![Workspace settings](readme-assets/workspace-setting.png)
-
-The workspace folder structure:
-
+```bash
+CROSSREF_MAILTO=you@example.com uv run run_desktop.py
 ```
-your-workspace/
-├── corpus_cabinet.db      ← all metadata, tags, and paper records
+
+If `WORKSPACE_DIR` is not set, the app creates its default library under the
+platform's application-data directory.
+
+## Online search and Offline Mode
+
+Type in the paper-panel search field to filter the local library as you go. Press
+Enter to search Crossref, arXiv, and OpenAlex in the background; the button is
+also available for mouse users. The app combines duplicate records and shows the
+title, authors, venue, year, DOI, abstract, and available links for confirmation.
+You can apply the metadata to the selected local paper or save it to the current
+project without a local PDF.
+
+When a result exposes a direct open-access PDF URL, **Download PDF** downloads it
+in the background, imports it into the current project, extracts its text, and
+keeps the online metadata and source links. Results with only a publisher page
+remain available through **Open source**; the app does not bypass paywalls.
+
+Once a paper has saved source metadata, its detail view keeps **Open source** and
+**Google Scholar** actions available, so you do not need to search for the paper
+again. Offline Mode disables those external actions while preserving local use.
+
+Enable **Offline mode** in the header whenever you want a visibly local-only
+session. The toggle is persisted in the workspace registry. While it is on,
+the online search and external-link actions are disabled, but projects, local
+search, PDFs, citation-only records, and AI context preparation continue to
+work. Search results are never accepted or written automatically.
+
+## Library layout
+
+```text
+your-library/
+├── corpus_cabinet.db
 └── projects/
-    └── {project_name}/
-        └── paper.pdf      ← original uploaded PDFs
+    └── Project Name/
+        └── paper.pdf
 ```
 
-### Creating a project
+The workspace registry is stored in the platform application-config directory.
+The library itself remains an ordinary folder that can be backed up or moved.
 
-Click **+ New project** in the sidebar and enter a name. Projects are colour-coded for easy identification. Each project gets its own subfolder inside the workspace.
+## Architecture
 
-### Adding a paper
+```text
+PySide6 desktop UI
+        │
+        ▼
+Local application engine
+├── storage.py       SQLite and library operations
+├── pdfs.py          PDF metadata and bounded text extraction
+├── search.py        Crossref, arXiv, and OpenAlex adapters
+└── assistant.py     AI-provider boundary and paper context preparation
+```
 
-1. Select a project in the sidebar.
-2. Drag a PDF onto the drop zone in the middle panel, or click it to open a file picker.
-3. The upload pipeline runs automatically:
-   - Title extracted from the PDF
-   - Google Scholar queried for metadata + BibTeX
-   - Claude generates a structured summary
-4. The paper appears in the list when processing is complete (typically 5–15 seconds).
+The UI talks directly to the application engine. There is no FastAPI process,
+browser tab, or localhost port in the desktop path.
 
-### Viewing a paper
+## Tests
 
-Click any paper card to open the detail panel on the right, which shows:
+```bash
+uv run pytest -q
+```
 
-- Title, authors, conference, year
-- AI summary — task and methodology in plain English
-- Tags
-- BibTeX (with copy button)
-- Datasets and evaluation metrics extracted by AI
+The tests use temporary libraries and an offscreen Qt platform. They do not
+call the internet, SerpAPI, or an AI provider; provider responses are mocked.
 
-### Tagging
+## Packaging direction
 
-In the detail panel, click **+ Add tag** to add a tag to a paper. Type a new tag name or select an existing one from the suggestions. Tags are auto-coloured and appear in the sidebar for filtering.
-
-To filter by tag, click any tag in the **Filter by tag** section of the sidebar. Click again to clear the filter.
-
-### Searching
-
-Use the search bar at the top of the middle panel to filter by title. Use the **This project / All projects** toggle to scope the search.
-
-### Copying BibTeX
-
-Open a paper, scroll to the BibTeX section, and click **Copy**. The full BibTeX entry is copied to your clipboard.
-
----
-
-## Limitations
-
-- Upload pipeline is synchronous — the request blocks while Scholar + Claude run. For personal use this is fine; large batches will be slow.
-- Scholar metadata quality depends on SerpAPI finding the paper. Niche or very new papers may not match.
-- Title extraction is heuristic (largest font on page 1) and occasionally picks up a section header instead of the actual title.
+The production packaging path is `pyside6-deploy`/Nuitka, with builds made on
+native macOS, Windows, and Linux runners. The intended release artifacts are a
+signed/notarized macOS app, a signed Windows installer, and a Linux AppImage.

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "corpus-cabinet"
+version = "0.1.0"
+description = "A native desktop academic reference manager"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6",
+    "SQLAlchemy",
+    "PyMuPDF",
+    "requests",
+    "anthropic",
+    "python-dotenv",
+]
+
+[project.scripts]
+corpus-cabinet = "corpus_cabinet.desktop:run_app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/corpus_cabinet"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
