@@ -24,6 +24,7 @@ class WorkspaceManager:
         self.workspaces = []
         self.active_path = None
         self.offline_mode = False
+        self.dyslexic_font = False
         self.load()
 
     def load(self):
@@ -54,6 +55,7 @@ class WorkspaceManager:
             self.active_path = os.path.abspath(os.path.expanduser(active_path))
 
         self.offline_mode = bool(data.get("offline_mode", False))
+        self.dyslexic_font = bool(data.get("dyslexic_font", False))
 
         if self.active_path and not self.find(self.active_path):
             self.active_path = None
@@ -65,6 +67,7 @@ class WorkspaceManager:
             "workspaces": self.workspaces,
             "active_workspace": self.active_path,
             "offline_mode": self.offline_mode,
+            "dyslexic_font": self.dyslexic_font,
         }
         temporary_path = self.config_path + ".tmp"
         with open(temporary_path, "w", encoding="utf-8") as handle:
@@ -130,6 +133,15 @@ class WorkspaceManager:
         """Return whether online features are explicitly disabled."""
         return self.offline_mode
 
+    def set_dyslexic_font(self, enabled):
+        """Persist the abstract reading-font preference."""
+        self.dyslexic_font = bool(enabled)
+        self.save()
+
+    def is_dyslexic_font_enabled(self):
+        """Return whether abstracts should use OpenDyslexic."""
+        return self.dyslexic_font
+
 
 class Library:
     """Provide direct, thread-safe-by-connection access to one library."""
@@ -155,6 +167,7 @@ class Library:
                 id INTEGER PRIMARY KEY,
                 name TEXT UNIQUE NOT NULL,
                 color TEXT DEFAULT '#7F77DD',
+                search_context TEXT DEFAULT '',
                 folder_path TEXT NOT NULL,
                 position INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -176,8 +189,10 @@ class Library:
                 doi TEXT DEFAULT '',
                 external_id TEXT DEFAULT '',
                 external_url TEXT DEFAULT '',
+                project_url TEXT DEFAULT '',
                 pdf_url TEXT DEFAULT '',
                 metadata_source TEXT DEFAULT '',
+                citation_count INTEGER DEFAULT 0,
                 extracted_text TEXT DEFAULT '',
                 file_path TEXT NOT NULL,
                 scholar_id TEXT DEFAULT '',
@@ -198,14 +213,17 @@ class Library:
             """
         )
         self.ensure_column(connection, "projects", "position", "INTEGER")
+        self.ensure_column(connection, "projects", "search_context", "TEXT DEFAULT ''")
         self.ensure_column(connection, "papers", "extracted_text", "TEXT DEFAULT ''")
         self.ensure_column(connection, "papers", "position", "INTEGER")
         self.ensure_column(connection, "papers", "abstract", "TEXT DEFAULT ''")
         self.ensure_column(connection, "papers", "doi", "TEXT DEFAULT ''")
         self.ensure_column(connection, "papers", "external_id", "TEXT DEFAULT ''")
         self.ensure_column(connection, "papers", "external_url", "TEXT DEFAULT ''")
+        self.ensure_column(connection, "papers", "project_url", "TEXT DEFAULT ''")
         self.ensure_column(connection, "papers", "pdf_url", "TEXT DEFAULT ''")
         self.ensure_column(connection, "papers", "metadata_source", "TEXT DEFAULT ''")
+        self.ensure_column(connection, "papers", "citation_count", "INTEGER DEFAULT 0")
         connection.commit()
         connection.close()
 
@@ -240,6 +258,17 @@ class Library:
         if row:
             return dict(row)
         return None
+
+    def update_project_search_context(self, project_id, context):
+        context = " ".join(str(context or "").split())
+        connection = self.connect()
+        connection.execute(
+            "UPDATE projects SET search_context = ? WHERE id = ?",
+            (context, project_id),
+        )
+        connection.commit()
+        connection.close()
+        return self.get_project(project_id)
 
     def create_project(self, name, color="#7F77DD"):
         name = name.strip()
@@ -391,6 +420,53 @@ class Library:
 
         return self.get_paper(paper_id)
 
+    def attach_pdf(self, paper_id, source_path):
+        """Copy and index a PDF for an existing citation-only paper."""
+        paper = self.get_paper(paper_id)
+        if not paper:
+            raise ValueError("Paper not found")
+        if paper.get("file_path"):
+            raise ValueError("This paper already has a local PDF")
+        if not source_path.lower().endswith(".pdf"):
+            raise ValueError("Only PDF files are supported")
+
+        project = self.get_project(paper["project_id"])
+        if not project:
+            raise ValueError("Project not found")
+
+        destination = unique_destination(
+            project["folder_path"],
+            os.path.basename(source_path),
+        )
+        shutil.copy2(source_path, destination)
+
+        try:
+            metadata = extract_pdf_metadata(destination)
+            extracted_text = extract_pdf_text(destination)
+            connection = self.connect()
+            connection.execute(
+                """
+                UPDATE papers
+                SET authors = CASE WHEN authors = '' THEN ? ELSE authors END,
+                    extracted_text = ?, file_path = ?
+                WHERE id = ?
+                """,
+                (
+                    metadata.get("authors", ""),
+                    extracted_text,
+                    destination,
+                    paper_id,
+                ),
+            )
+            connection.commit()
+            connection.close()
+        except Exception:
+            if os.path.exists(destination):
+                os.remove(destination)
+            raise
+
+        return self.get_paper(paper_id)
+
     def create_paper_from_search(self, project_id, result):
         """Save a confirmed online result as a paper without a local PDF."""
         project = self.get_project(project_id)
@@ -412,9 +488,9 @@ class Library:
             """
             INSERT INTO papers (
                 project_id, title, authors, conference, year, abstract, doi,
-                external_id, external_url, pdf_url, metadata_source, file_path,
-                position, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                external_id, external_url, project_url, pdf_url, metadata_source,
+                citation_count, file_path, position, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 project_id,
@@ -426,8 +502,10 @@ class Library:
                 str(result.get("doi") or ""),
                 str(result.get("external_id") or ""),
                 str(result.get("external_url") or ""),
+                str(result.get("project_url") or ""),
                 str(result.get("pdf_url") or ""),
                 str(result.get("source") or ""),
+                max(int(result.get("citation_count") or 0), 0),
                 "",
                 position,
                 created_at,
@@ -454,7 +532,8 @@ class Library:
             UPDATE papers
             SET title = ?, authors = ?, conference = ?, year = ?,
                 abstract = ?, doi = ?, external_id = ?, external_url = ?,
-                pdf_url = ?, metadata_source = ?
+                project_url = ?, pdf_url = ?, metadata_source = ?,
+                citation_count = ?
             WHERE id = ?
             """,
             (
@@ -466,10 +545,30 @@ class Library:
                 str(result.get("doi") or ""),
                 str(result.get("external_id") or ""),
                 str(result.get("external_url") or ""),
+                str(
+                    result.get("project_url")
+                    or paper.get("project_url")
+                    or ""
+                ),
                 str(result.get("pdf_url") or ""),
                 str(result.get("source") or ""),
+                max(int(result.get("citation_count") or 0), 0),
                 paper_id,
             ),
+        )
+        connection.commit()
+        connection.close()
+        return self.get_paper(paper_id)
+
+    def update_paper_bibtex(self, paper_id, bibtex):
+        """Persist a reviewed BibTeX entry without changing paper metadata."""
+        paper = self.get_paper(paper_id)
+        if not paper:
+            raise ValueError("Paper not found")
+        connection = self.connect()
+        connection.execute(
+            "UPDATE papers SET bibtex = ? WHERE id = ?",
+            (str(bibtex or "").strip(), paper_id),
         )
         connection.commit()
         connection.close()

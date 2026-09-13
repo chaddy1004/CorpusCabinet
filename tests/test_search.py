@@ -2,13 +2,18 @@
 
 import pytest
 
+import corpus_cabinet.search as search_module
+
 from corpus_cabinet.search import (
     ARXIV_URL,
     CROSSREF_URL,
     OPENALEX_URL,
     OfflineModeError,
     OnlineSearchService,
+    deduplicate_results,
     google_scholar_url,
+    normalize_search_query,
+    rank_search_result,
 )
 
 
@@ -24,6 +29,19 @@ ARXIV_RESPONSE = """
   </entry>
 </feed>
 """
+
+
+def inspect_project_page(url, config, session):
+    """Return deterministic project-page metadata without network access."""
+    return {
+        "title": "A Project Page Paper",
+        "authors": "Jane Doe",
+        "abstract": "Readable abstract.",
+        "external_url": url,
+        "project_url": url,
+        "pdf_url": "https://example.github.io/paper.pdf",
+        "arxiv_url": "",
+    }
 
 
 class FakeResponse:
@@ -63,6 +81,7 @@ class FakeSession:
                                 "DOI": "10.1000/example",
                                 "URL": "https://doi.org/10.1000/example",
                                 "abstract": "<p>A Crossref abstract.</p>",
+                                "is-referenced-by-count": 12,
                             }
                         ]
                     }
@@ -98,6 +117,8 @@ class FakeSession:
                                 "OpenAlex": [1],
                                 "abstract.": [2],
                             },
+                            "cited_by_count": 10,
+                            "relevance_score": 42.0,
                         }
                     ]
                 }
@@ -111,15 +132,73 @@ def test_online_search_normalizes_and_merges_provider_results():
 
     results = service.search("A Useful Paper")
 
-    assert len(results) == 2
+    assert len(results) == 1
     merged = results[0]
     assert merged["title"] == "A Useful Paper"
     assert merged["doi"] == "10.1000/example"
     assert "Crossref" in merged["source"]
+    assert "arXiv" in merged["source"]
     assert "OpenAlex" in merged["source"]
     assert merged["is_open_access"] is True
-    assert results[1]["external_id"] == "2401.12345"
+    assert merged["citation_count"] == 12
+    assert merged["venue"] == "Journal of Examples"
+    assert merged["external_url"] == "https://doi.org/10.1000/example"
+    assert merged["pdf_url"] == "https://arxiv.org/pdf/2401.12345v2"
     assert len(session.calls) == 3
+    crossref_call = session.calls[0]
+    arxiv_call = session.calls[1]
+    openalex_call = session.calls[2]
+    assert crossref_call[1]["rows"] == 10
+    assert arxiv_call[1]["search_query"] == 'all:"A Useful Paper"'
+    assert openalex_call[1]["search"] == "A Useful Paper"
+    assert "search.exact" not in openalex_call[1]
+
+
+def test_deduplication_joins_changed_preprint_title_by_doi():
+    published = {
+        "title": "Published Conference Title",
+        "doi": "10.1000/version",
+        "venue": "Example Conference",
+        "external_url": "https://doi.org/10.1000/version",
+        "source": "Crossref",
+        "citation_count": 8,
+    }
+    preprint = {
+        "title": "Earlier Preprint Title",
+        "doi": "10.1000/version",
+        "pdf_url": "https://arxiv.org/pdf/1234.56789",
+        "source": "arXiv",
+        "citation_count": 0,
+    }
+
+    results = deduplicate_results(
+        [published, preprint],
+        "Published Conference Title",
+    )
+
+    assert len(results) == 1
+    assert results[0]["title"] == "Published Conference Title"
+    assert results[0]["venue"] == "Example Conference"
+    assert results[0]["pdf_url"] == "https://arxiv.org/pdf/1234.56789"
+    assert results[0]["source"] == "Crossref, arXiv"
+
+
+def test_project_page_url_becomes_a_search_result(monkeypatch):
+    monkeypatch.setattr(
+        search_module,
+        "inspect_project_page",
+        inspect_project_page,
+    )
+    service = OnlineSearchService()
+    service.providers = []
+
+    results = service.search("https://example.github.io/paper/")
+
+    assert len(results) == 1
+    assert results[0]["title"] == "A Project Page Paper"
+    assert results[0]["project_url"] == "https://example.github.io/paper/"
+    assert results[0]["pdf_url"] == "https://example.github.io/paper.pdf"
+    assert results[0]["source"] == "Project page"
 
 
 def test_offline_mode_makes_no_provider_requests():
@@ -136,3 +215,112 @@ def test_offline_mode_makes_no_provider_requests():
 def test_google_scholar_url_is_a_user_driven_handoff():
     url = google_scholar_url("A Useful Paper")
     assert url == "https://scholar.google.com/scholar?q=A+Useful+Paper"
+
+
+def test_pasted_identifiers_are_normalized_for_direct_search():
+    assert normalize_search_query(
+        "https://arxiv.org/abs/2506.01185v2"
+    ) == "2506.01185"
+    assert normalize_search_query(
+        "https://doi.org/10.1000/example"
+    ) == "10.1000/example"
+
+    session = FakeSession()
+    service = OnlineSearchService(session=session)
+    service.search("https://arxiv.org/abs/2506.01185v2")
+
+    assert len(session.calls) == 3
+    assert session.calls[0][1]["query.bibliographic"] == "2506.01185"
+    assert session.calls[1][1]["id_list"] == "2506.01185"
+    assert "search_query" not in session.calls[1][1]
+    assert session.calls[2][1]["search"] == "2506.01185"
+
+
+def test_project_context_reranks_ambiguous_homer_results():
+    results = [
+        {
+            "title": "Homer: Odyssey, Book 1",
+            "abstract": "A translation of the ancient Greek epic.",
+            "citation_count": 5000,
+            "source": "Crossref",
+        },
+        {
+            "title": (
+                "HoMeR: Learning In-the-Wild Mobile Manipulation via "
+                "Hybrid Imitation and Whole-Body Control"
+            ),
+            "abstract": "A robotics framework for mobile manipulation.",
+            "citation_count": 2,
+            "source": "arXiv",
+        },
+    ]
+
+    ranked = deduplicate_results(
+        results,
+        "HoMeR",
+        "robotics, mobile, manipulation",
+    )
+
+    assert ranked[0]["title"].startswith("HoMeR: Learning")
+    assert ranked[0]["context_score"] > ranked[1]["context_score"]
+
+
+def test_short_query_uses_context_for_additional_retrieval():
+    session = FakeSession()
+    service = OnlineSearchService(session=session)
+
+    service.search("HoMeR", "robotics, mobile, manipulation")
+
+    assert len(session.calls) == 5
+    contextual_arxiv_call = session.calls[2]
+    contextual_openalex_call = session.calls[4]
+    assert contextual_arxiv_call[1]["search_query"] == (
+        'all:"HoMeR" AND (all:robotics OR all:mobile OR all:manipulation)'
+    )
+    assert contextual_openalex_call[1]["search"] == (
+        "HoMeR robotics mobile manipulation"
+    )
+
+
+def test_acronym_in_abstract_can_beat_an_unrelated_title_match():
+    results = [
+        {
+            "title": "Lapa River Tourism",
+            "abstract": "A regional tourism study.",
+            "citation_count": 0,
+            "source": "Crossref",
+        },
+        {
+            "title": "Latent Action Pretraining from Videos",
+            "abstract": (
+                "We introduce LAPA for latent action pretraining in "
+                "robotics videos."
+            ),
+            "citation_count": 1,
+            "source": "arXiv",
+        },
+    ]
+
+    ranked = deduplicate_results(
+        results,
+        "LAPA",
+        "robotics, action, videos",
+    )
+
+    assert ranked[0]["title"] == "Latent Action Pretraining from Videos"
+
+
+def test_citations_are_a_small_ranking_tiebreaker():
+    uncited = {
+        "title": "An Exact Match",
+        "abstract": "",
+        "citation_count": 0,
+    }
+    cited = dict(uncited)
+    cited["citation_count"] = 1000
+
+    rank_search_result(uncited, "An Exact Match", "")
+    rank_search_result(cited, "An Exact Match", "")
+
+    assert cited["score"] > uncited["score"]
+    assert cited["score"] - uncited["score"] <= 0.06

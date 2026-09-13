@@ -6,12 +6,16 @@ DOI, abstract, source identifiers, landing URLs, and open-access PDF URLs.
 """
 
 import html
+import math
 import re
 import xml.etree.ElementTree as ET
+from collections import Counter
 from difflib import SequenceMatcher
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 import requests
+
+from corpus_cabinet.links import inspect_project_page
 
 
 CROSSREF_URL = "https://api.crossref.org/v1/works"
@@ -43,10 +47,13 @@ class SearchProvider:
         else:
             self.session = session
         self.timeout = config.get("search_timeout_seconds", 15)
-        self.limit = config.get("search_result_limit", 5)
+        self.limit = config.get("search_result_limit", 10)
 
     def search(self, title):
         raise NotImplementedError
+
+    def search_with_context(self, title, context):
+        return []
 
     def request_json(self, url, params, headers=None):
         if headers is None:
@@ -122,6 +129,8 @@ class CrossrefProvider(SearchProvider):
                     pdf_url=crossref_pdf_url(item),
                     source=self.name,
                     is_open_access=False,
+                    citation_count=item.get("is-referenced-by-count", 0),
+                    provider_score=item.get("score", 0),
                 )
             )
 
@@ -134,14 +143,42 @@ class ArxivProvider(SearchProvider):
     name = "arXiv"
 
     def search(self, title):
+        arxiv_id = arxiv_query_id(title)
+        if arxiv_id:
+            params = {
+                "id_list": arxiv_id,
+                "start": 0,
+                "max_results": self.limit,
+            }
+            return self.search_params(params)
         query_title = title.replace('"', "")
+        expression = 'all:"' + query_title + '"'
+        return self.search_expression(expression)
+
+    def search_with_context(self, title, context):
+        query_title = title.replace('"', "")
+        terms = context_query_terms(context)
+        if not terms:
+            return []
+        clauses = []
+        for term in terms:
+            clauses.append("all:" + term)
+        expression = (
+            'all:"' + query_title + '" AND (' + " OR ".join(clauses) + ")"
+        )
+        return self.search_expression(expression)
+
+    def search_expression(self, expression):
         params = {
-            "search_query": 'ti:"' + query_title + '"',
+            "search_query": expression,
             "start": 0,
             "max_results": self.limit,
             "sortBy": "relevance",
             "sortOrder": "descending",
         }
+        return self.search_params(params)
+
+    def search_params(self, params):
         text = self.request_text(ARXIV_URL, params)
         root = ET.fromstring(text)
         results = []
@@ -186,6 +223,8 @@ class ArxivProvider(SearchProvider):
                     pdf_url=pdf_url,
                     source=self.name,
                     is_open_access=True,
+                    citation_count=0,
+                    provider_score=0,
                 )
             )
 
@@ -197,14 +236,21 @@ class OpenAlexProvider(SearchProvider):
 
     name = "OpenAlex"
 
+    def search_with_context(self, title, context):
+        terms = context_query_terms(context)
+        if not terms:
+            return []
+        expanded_query = title + " " + " ".join(terms)
+        return self.search(expanded_query)
+
     def search(self, title):
         params = {
-            "search.exact": title,
+            "search": title,
             "per-page": self.limit,
             "select": (
                 "id,doi,display_name,publication_year,authorships,"
                 "primary_location,open_access,best_oa_location,"
-                "abstract_inverted_index"
+                "abstract_inverted_index,cited_by_count,relevance_score"
             ),
         }
         data = self.request_json(OPENALEX_URL, params)
@@ -250,6 +296,8 @@ class OpenAlexProvider(SearchProvider):
                     pdf_url=safe_text(best_location.get("pdf_url")),
                     source=self.name,
                     is_open_access=bool(open_access.get("is_oa")),
+                    citation_count=item.get("cited_by_count", 0),
+                    provider_score=item.get("relevance_score", 0),
                 )
             )
 
@@ -280,15 +328,31 @@ class OnlineSearchService:
     def is_offline(self):
         return self.offline
 
-    def search(self, title):
-        title = safe_text(title)
-        if not title:
-            raise ValueError("Search title cannot be empty")
+    def search(self, title, context=""):
+        raw_query = safe_text(title)
         if self.offline:
             raise OfflineModeError(
                 "Online search is disabled while Offline Mode is enabled"
             )
+        parsed_query = urlparse(raw_query)
+        is_project_page = (
+            parsed_query.scheme in ("http", "https")
+            and bool(parsed_query.netloc)
+            and not arxiv_query_id(raw_query)
+            and "doi.org/" not in raw_query.lower()
+            and not raw_query.lower().split("?", 1)[0].endswith(".pdf")
+        )
+        if is_project_page:
+            return self.search_project_page(raw_query, context)
 
+        title = normalize_search_query(raw_query)
+        if not title:
+            raise ValueError("Search title cannot be empty")
+
+        return self.search_providers(title, context)
+
+    def search_providers(self, title, context=""):
+        """Search normalized provider queries and merge their results."""
         self.last_errors = []
         results = []
         for provider in self.providers:
@@ -297,12 +361,68 @@ class OnlineSearchService:
             except (requests.RequestException, ET.ParseError, ValueError) as error:
                 self.last_errors.append(provider.name + ": " + str(error))
 
+            if should_expand_query(title, context):
+                try:
+                    results.extend(provider.search_with_context(title, context))
+                except (
+                    requests.RequestException,
+                    ET.ParseError,
+                    ValueError,
+                ) as error:
+                    self.last_errors.append(
+                        provider.name + " context: " + str(error)
+                    )
+
         if not results and self.last_errors:
             raise OnlineSearchError(
                 "No online search provider returned results"
             )
 
-        return deduplicate_results(results, title)
+        return deduplicate_results(results, title, context)
+
+    def search_project_page(self, url, context=""):
+        """Resolve a project website through visible scholarly links."""
+        page = inspect_project_page(url, self.config, self.session)
+        results = []
+        if page.get("arxiv_url"):
+            arxiv_query = normalize_search_query(page["arxiv_url"])
+            try:
+                results.extend(self.search_providers(arxiv_query, context))
+            except OnlineSearchError:
+                pass
+        elif page.get("doi"):
+            try:
+                results.extend(self.search_providers(page["doi"], context))
+            except OnlineSearchError:
+                pass
+
+        if page.get("title"):
+            try:
+                results.extend(self.search_providers(page["title"], context))
+            except OnlineSearchError:
+                pass
+        elif results:
+            page["title"] = results[0].get("title", "")
+
+        page_result = make_search_result(
+            title=page.get("title", ""),
+            authors=page.get("authors", ""),
+            venue=page.get("venue", ""),
+            year=page.get("year"),
+            doi=page.get("doi", ""),
+            abstract=page.get("abstract", ""),
+            external_id="",
+            external_url=page.get("external_url", url),
+            pdf_url=page.get("pdf_url", ""),
+            source="Project page",
+            is_open_access=bool(page.get("pdf_url") or page.get("arxiv_url")),
+            citation_count=0,
+            provider_score=0,
+            project_url=page.get("project_url", url),
+        )
+        results.append(page_result)
+        ranking_query = page.get("title") or url
+        return deduplicate_results(results, ranking_query, context)
 
 
 def safe_text(value):
@@ -431,6 +551,39 @@ def normalize_doi(value):
     return value.rstrip(" .")
 
 
+def arxiv_query_id(value):
+    """Extract an arXiv identifier from an ID or pasted arXiv URL."""
+    value = safe_text(value)
+    match = re.search(
+        r"(?:arxiv:\s*)?(\d{4}\.\d{4,5})(?:v\d+)?",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    return match.group(1)
+
+
+def normalize_search_query(value):
+    """Normalize common pasted scholarly identifiers before retrieval."""
+    value = safe_text(value)
+    arxiv_id = arxiv_query_id(value)
+    if arxiv_id:
+        return arxiv_id
+    if re.match(
+        r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)10\.",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        value = re.sub(
+            r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        )
+    return value
+
+
 def normalize_title(value):
     """Normalize title punctuation and whitespace for matching."""
     value = html.unescape(str(value or "")).lower()
@@ -452,6 +605,111 @@ def title_similarity(query, title):
     return round(SequenceMatcher(None, query, title).ratio(), 4)
 
 
+def query_match_score(query, result):
+    """Score exact terms and acronyms without penalizing long paper titles."""
+    query = normalize_title(query)
+    title = normalize_title(result.get("title"))
+    if not query or not title:
+        return 0
+
+    score = title_similarity(query, title)
+    if query == title:
+        score = 1
+    elif title.startswith(query + " "):
+        score = max(score, 0.98)
+    elif " " + query + " " in " " + title + " ":
+        score = max(score, 0.94)
+    elif query in title:
+        score = max(score, 0.88)
+
+    abstract = normalize_title(result.get("abstract"))
+    if " " + query + " " in " " + abstract + " ":
+        score = max(score, 0.9)
+
+    return round(score, 4)
+
+
+def context_words(value):
+    """Return meaningful lowercase words for project-context matching."""
+    stop_words = {
+        "about", "after", "also", "among", "been", "before", "being",
+        "between", "both", "could", "from", "have", "into", "more",
+        "most", "other", "over", "paper", "results", "show", "than",
+        "that", "their", "there", "these", "they", "this", "through",
+        "using", "were", "which", "while", "with", "within", "would",
+    }
+    words = re.findall(r"[a-z][a-z0-9-]{2,}", safe_text(value).lower())
+    output = []
+    for word in words:
+        if word not in stop_words:
+            output.append(word)
+    return output
+
+
+def context_query_terms(value, limit=3):
+    """Return a few unique terms for contextual provider retrieval."""
+    terms = []
+    for word in context_words(value):
+        if word not in terms:
+            terms.append(word)
+        if len(terms) == limit:
+            break
+    return terms
+
+
+def should_expand_query(query, context):
+    """Use contextual retrieval only for short, ambiguous searches."""
+    if arxiv_query_id(query) or normalize_doi(query) != query:
+        return False
+    query_terms = normalize_title(query).split()
+    return len(query_terms) <= 2 and bool(context_query_terms(context))
+
+
+def suggest_context_terms(value, limit=8):
+    """Summarize project text as editable search-preference terms."""
+    counts = Counter(context_words(value))
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    terms = []
+    for word, count in ranked[:limit]:
+        terms.append(word)
+    return ", ".join(terms)
+
+
+def context_match_score(context, result):
+    """Measure how much a result overlaps the user's visible context terms."""
+    preferred = set(context_words(context))
+    if not preferred:
+        return 0
+
+    searchable = " ".join(
+        [
+            safe_text(result.get("title")),
+            safe_text(result.get("abstract")),
+            safe_text(result.get("venue")),
+        ]
+    )
+    available = set(context_words(searchable))
+    matches = preferred.intersection(available)
+    denominator = min(len(preferred), 6)
+    if denominator == 0:
+        return 0
+    return round(min(len(matches) / denominator, 1), 4)
+
+
+def citation_score(citation_count):
+    """Compress citation counts so popularity cannot dominate relevance."""
+    citation_count = safe_citation_count(citation_count)
+    return round(min(math.log10(citation_count + 1) / 4, 1), 4)
+
+
+def safe_citation_count(value):
+    """Normalize a provider citation count to a non-negative integer."""
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def make_search_result(
     title,
     authors,
@@ -464,6 +722,9 @@ def make_search_result(
     pdf_url,
     source,
     is_open_access,
+    citation_count,
+    provider_score,
+    project_url="",
 ):
     """Create the provider-neutral search-result shape."""
     return {
@@ -478,30 +739,32 @@ def make_search_result(
         "pdf_url": safe_text(pdf_url),
         "source": source,
         "is_open_access": bool(is_open_access),
+        "citation_count": safe_citation_count(citation_count),
+        "provider_score": provider_score or 0,
+        "project_url": safe_text(project_url),
     }
 
 
 def result_key(result):
-    """Build a stable key for merging provider duplicates."""
-    doi = normalize_doi(result.get("doi")).lower()
-    if doi:
-        return "doi:" + doi
-
-    if result.get("source") == "arXiv":
-        arxiv_id = safe_text(result.get("external_id")).lower()
-        if arxiv_id:
-            return "arxiv:" + arxiv_id
-
-    title = normalize_title(result.get("title"))
-    year = result.get("year")
-    if title and year:
-        return "title:" + title + "|" + str(year)
-    if title:
-        return "title:" + title
-
+    """Build a stable primary key for one provider result."""
+    keys = result_keys(result)
+    if keys:
+        return keys[0]
     source = safe_text(result.get("source"))
     external_id = safe_text(result.get("external_id"))
     return "source:" + source + ":" + external_id
+
+
+def result_keys(result):
+    """Return DOI and title aliases used to join publication versions."""
+    keys = []
+    doi = normalize_doi(result.get("doi")).lower()
+    if doi:
+        keys.append("doi:" + doi)
+    title = normalize_title(result.get("title"))
+    if title:
+        keys.append("title:" + title)
+    return keys
 
 
 def merge_search_result(existing, candidate):
@@ -516,6 +779,8 @@ def merge_search_result(existing, candidate):
         "external_id",
         "external_url",
         "pdf_url",
+        "provider_score",
+        "project_url",
     ]
     for field in fields:
         if not existing.get(field) and candidate.get(field):
@@ -524,6 +789,10 @@ def merge_search_result(existing, candidate):
     existing["is_open_access"] = (
         bool(existing.get("is_open_access"))
         or bool(candidate.get("is_open_access"))
+    )
+    existing["citation_count"] = max(
+        safe_citation_count(existing.get("citation_count", 0)),
+        safe_citation_count(candidate.get("citation_count", 0)),
     )
     existing_sources = existing.get("source", "").split(", ")
     candidate_source = safe_text(candidate.get("source"))
@@ -540,20 +809,46 @@ def result_sort_key(result):
     return score
 
 
-def deduplicate_results(results, query):
-    """Merge duplicate records and sort them by title match."""
+def rank_search_result(result, query, context):
+    """Attach transparent query, context, citation, and final rank scores."""
+    query_score = query_match_score(query, result)
+    preference_score = context_match_score(context, result)
+    popularity_score = citation_score(result.get("citation_count", 0))
+    score = (
+        query_score * 0.74
+        + preference_score * 0.20
+        + popularity_score * 0.06
+    )
+    result["query_score"] = query_score
+    result["context_score"] = preference_score
+    result["citation_score"] = popularity_score
+    result["score"] = round(score, 4)
+
+
+def deduplicate_results(results, query, context=""):
+    """Merge duplicate records and rank them with visible user preferences."""
     merged = {}
+    output = []
     for result in results:
         if not result.get("title"):
             continue
-        key = result_key(result)
-        if key not in merged:
+        existing = None
+        for key in result_keys(result):
+            if key in merged:
+                existing = merged[key]
+                break
+        if existing is None:
             item = dict(result)
-            item["score"] = title_similarity(query, item["title"])
-            merged[key] = item
+            output.append(item)
         else:
-            merge_search_result(merged[key], result)
+            item = existing
+            merge_search_result(item, result)
+        for key in result_keys(item):
+            merged[key] = item
+        for key in result_keys(result):
+            merged[key] = item
 
-    output = list(merged.values())
+    for result in output:
+        rank_search_result(result, query, context)
     output.sort(key=result_sort_key, reverse=True)
     return output

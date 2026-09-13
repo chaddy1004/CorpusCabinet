@@ -35,13 +35,13 @@ Requirements: Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-uv run run_desktop.py
+./run.sh
 ```
 
-The equivalent installed command is:
+The equivalent direct command is:
 
 ```bash
-uv run corpus-cabinet
+uv run run_desktop.py
 ```
 
 Set `WORKSPACE_DIR` when developing against a specific library folder:
