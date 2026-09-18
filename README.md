@@ -15,6 +15,11 @@ or local web server.
 - Bounded extracted text stored for future AI assistance
 - Search by paper title or authors
 - In-app PDF viewing
+- Home “Recently opened” with saved PDF page and zoom, including full-screen reading
+- Unread / Reading / Read status, favorites, and reading-status sorting
+- Separate library-wide search across titles, authors, abstracts, extracted PDF text,
+  personal notes, and PDF comments, with match excerpts
+- Autosaved project research notes, separate from individual paper notes
 - Native confirmation dialogs and background PDF importing
 - Online title search through Crossref, arXiv, and OpenAlex
 - User-controlled Offline Mode that keeps all local features available
@@ -61,9 +66,9 @@ platform's application-data directory.
 
 ## Online search and Offline Mode
 
-Type in the paper-panel search field to filter the local library as you go. Press
-Enter to search Crossref, arXiv, and OpenAlex in the background; the button is
-also available for mouse users. The app combines duplicate records and shows the
+Use **+ Add paper** in the currently selected project's Papers pane to upload
+PDFs or search online by title or paper link. The app searches Crossref, arXiv,
+and OpenAlex in the background. It combines duplicate records and shows the
 title, authors, venue, year, DOI, abstract, and available links for confirmation.
 You can apply the metadata to the selected local paper or save it to the current
 project without a local PDF.
@@ -82,6 +87,32 @@ session. The toggle is persisted in the workspace registry. While it is on,
 the online search and external-link actions are disabled, but projects, local
 search, PDFs, citation-only records, and AI context preparation continue to
 work. Search results are never accepted or written automatically.
+
+## Reading and research workflow
+
+- **Recently opened** on Home reopens a recently opened PDF at its saved page and
+  zoom. Opening Details alone does not add a paper to reading history.
+- Zoom PDFs with the percentage menu, **−/+** buttons, trackpad pinch, or
+  Ctrl/Cmd + scroll. Both PDF readers remember custom zoom levels (25–400%).
+- Choose **Reading status** or **Favorite** below the paper title. Status is
+  explicitly controlled by you; it does not automatically change on opening a PDF.
+- Project rows also have a yellow-star favorite toggle, independent of paper
+  favorites. Starring a project does not change the current selection or order.
+- **+ Add tags / Edit tags** accepts comma-separated labels. Click a tag to find
+  matching papers across projects, or use `tag:robotics` / `tag:"latent actions"`
+  in library search. Tags are case-insensitive and copied to new paper copies;
+  editing tags afterward affects only that copy.
+- **Search library** in the header (Cmd/Ctrl+F) searches saved papers across all
+  projects, including notes and page comments. It works offline and never sends
+  your query or paper text to an online service. PDF text search covers the bounded
+  text extracted during import, not OCR of scanned pages.
+- **Project notes…** beneath the Projects list opens an autosaved plain-text
+  workspace for cross-paper findings, open questions, baselines, and next steps.
+- Independent paper copies have separate reading positions and can have different
+  reading statuses. Copying initially preserves the status, favorite, and notes;
+  moving out of ScrapBook retains the original record's reading state.
+
+See [TODO.md](TODO.md) for completed priorities and the living feature backlog.
 
 ## Library layout
 

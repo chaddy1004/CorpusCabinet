@@ -44,6 +44,26 @@ def inspect_project_page(url, config, session):
     }
 
 
+def inspect_arxiv_page(url, config, session):
+    """Return deterministic metadata from an arXiv abstract page."""
+    return {
+        "title": "Riemannian Motion Policies",
+        "authors": "Nathan D. Ratliff, Jan Issac",
+        "abstract": "An exact arXiv abstract.",
+        "year": 2018,
+        "doi": "10.48550/arXiv.1801.02854",
+        "external_url": url,
+        "project_url": url,
+        "pdf_url": "https://arxiv.org/pdf/1801.02854",
+        "arxiv_url": url,
+    }
+
+
+def fail_arxiv_search(title):
+    """Simulate an unavailable arXiv metadata endpoint."""
+    raise search_module.requests.Timeout("metadata endpoint timed out")
+
+
 class FakeResponse:
     """Minimal requests response for provider tests."""
 
@@ -230,10 +250,35 @@ def test_pasted_identifiers_are_normalized_for_direct_search():
     service.search("https://arxiv.org/abs/2506.01185v2")
 
     assert len(session.calls) == 3
-    assert session.calls[0][1]["query.bibliographic"] == "2506.01185"
-    assert session.calls[1][1]["id_list"] == "2506.01185"
-    assert "search_query" not in session.calls[1][1]
-    assert session.calls[2][1]["search"] == "2506.01185"
+    assert session.calls[0][0] == ARXIV_URL
+    assert session.calls[0][1]["id_list"] == "2506.01185"
+    assert "search_query" not in session.calls[0][1]
+    assert session.calls[1][1]["query.bibliographic"] == "A Useful Paper"
+    assert session.calls[2][1]["search"] == "A Useful Paper"
+
+
+def test_arxiv_api_timeout_falls_back_to_exact_page(monkeypatch):
+    session = FakeSession()
+    service = OnlineSearchService(session=session)
+
+    monkeypatch.setattr(service.providers[1], "search", fail_arxiv_search)
+    monkeypatch.setattr(
+        search_module,
+        "inspect_project_page",
+        inspect_arxiv_page,
+    )
+
+    results = service.search("https://arxiv.org/abs/1801.02854")
+
+    assert len(results) == 1
+    assert results[0]["title"] == "Riemannian Motion Policies"
+    assert results[0]["external_id"] == "1801.02854"
+    assert results[0]["pdf_url"] == "https://arxiv.org/pdf/1801.02854"
+    assert results[0]["query_score"] == 1.0
+    assert all("1801.02854" not in str(call[1]) for call in session.calls)
+    assert service.last_errors == [
+        "arXiv API: metadata endpoint timed out"
+    ]
 
 
 def test_project_context_reranks_ambiguous_homer_results():

@@ -15,7 +15,7 @@ from urllib.parse import quote_plus, urlparse
 
 import requests
 
-from corpus_cabinet.links import inspect_project_page
+from corpus_cabinet.links import LinkImportError, inspect_project_page
 
 
 CROSSREF_URL = "https://api.crossref.org/v1/works"
@@ -334,6 +334,9 @@ class OnlineSearchService:
             raise OfflineModeError(
                 "Online search is disabled while Offline Mode is enabled"
             )
+        arxiv_id = arxiv_query_id(raw_query)
+        if arxiv_id:
+            return self.search_arxiv_identifier(arxiv_id, context)
         parsed_query = urlparse(raw_query)
         is_project_page = (
             parsed_query.scheme in ("http", "https")
@@ -350,6 +353,86 @@ class OnlineSearchService:
             raise ValueError("Search title cannot be empty")
 
         return self.search_providers(title, context)
+
+    def search_arxiv_identifier(self, arxiv_id, context=""):
+        """Resolve an exact arXiv ID without exposing loose numeric matches."""
+        self.last_errors = []
+        result = None
+        for provider in self.providers:
+            if provider.name != "arXiv":
+                continue
+            try:
+                matches = provider.search(arxiv_id)
+                if matches:
+                    result = matches[0]
+            except (
+                requests.RequestException,
+                ET.ParseError,
+                ValueError,
+            ) as error:
+                self.last_errors.append("arXiv API: " + str(error))
+            break
+
+        if result is None:
+            page_url = "https://arxiv.org/abs/" + arxiv_id
+            try:
+                page = inspect_project_page(
+                    page_url,
+                    self.config,
+                    self.session,
+                )
+                result = make_search_result(
+                    title=page.get("title", ""),
+                    authors=page.get("authors", ""),
+                    venue=page.get("venue", ""),
+                    year=page.get("year"),
+                    doi=page.get("doi", ""),
+                    abstract=page.get("abstract", ""),
+                    external_id=arxiv_id,
+                    external_url=page_url,
+                    pdf_url=page.get("pdf_url", ""),
+                    source="arXiv",
+                    is_open_access=True,
+                    citation_count=0,
+                    provider_score=0,
+                )
+            except (requests.RequestException, LinkImportError) as error:
+                self.last_errors.append("arXiv page: " + str(error))
+
+        if result is None or not result.get("title"):
+            raise OnlineSearchError(
+                "The exact arXiv record " + arxiv_id + " could not be retrieved"
+            )
+
+        self.enrich_exact_result(result)
+        rank_search_result(result, result["title"], context)
+        return [result]
+
+    def enrich_exact_result(self, result):
+        """Merge only high-confidence metadata into an exact record."""
+        title = result.get("title", "")
+        for provider in self.providers:
+            if provider.name == "arXiv":
+                continue
+            try:
+                candidates = provider.search(title)
+            except (
+                requests.RequestException,
+                ET.ParseError,
+                ValueError,
+            ) as error:
+                self.last_errors.append(provider.name + ": " + str(error))
+                continue
+
+            best_match = None
+            best_score = 0
+            for candidate in candidates:
+                score = title_similarity(title, candidate.get("title", ""))
+                if score > best_score:
+                    best_match = candidate
+                    best_score = score
+            if best_match is not None and best_score >= 0.9:
+                merge_search_result(result, best_match)
 
     def search_providers(self, title, context=""):
         """Search normalized provider queries and merge their results."""
@@ -387,7 +470,9 @@ class OnlineSearchService:
         if page.get("arxiv_url"):
             arxiv_query = normalize_search_query(page["arxiv_url"])
             try:
-                results.extend(self.search_providers(arxiv_query, context))
+                results.extend(
+                    self.search_arxiv_identifier(arxiv_query, context)
+                )
             except OnlineSearchError:
                 pass
         elif page.get("doi"):

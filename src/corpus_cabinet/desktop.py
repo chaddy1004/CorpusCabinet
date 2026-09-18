@@ -7,15 +7,22 @@ there is no browser or local HTTP server.
 """
 
 import html
+import json
+import math
 import os
 import re
 import signal
 import sys
 import tempfile
+from urllib.parse import quote, unquote
 
 from PySide6.QtCore import (
+    QEvent,
     QObject,
+    QPointF,
+    QRectF,
     QRunnable,
+    QSize,
     QStandardPaths,
     Qt,
     QTimer,
@@ -26,20 +33,28 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
+    QFont,
     QFontDatabase,
+    QFontMetricsF,
     QKeySequence,
     QPalette,
+    QPainter,
+    QPen,
     QShortcut,
+    QTextDocument,
 )
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
 from PySide6.QtNetwork import QNetworkInformation
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFrame,
     QFormLayout,
     QHBoxLayout,
     QInputDialog,
@@ -47,14 +62,20 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QListView,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
+    QProxyStyle,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
+    QStyledItemDelegate,
+    QStyle,
+    QStyleOptionViewItem,
     QTabWidget,
     QTextBrowser,
     QVBoxLayout,
@@ -64,6 +85,7 @@ from dotenv import load_dotenv
 
 from corpus_cabinet.citations import fetch_doi_bibtex, generate_bibtex
 from corpus_cabinet.downloads import download_pdf
+from corpus_cabinet.research_ui import LibrarySearchDialog, ProjectNotesDialog
 from corpus_cabinet.search import (
     OnlineSearchService,
     google_scholar_url,
@@ -108,6 +130,12 @@ SUBSCRIPT_CHARACTERS = str.maketrans(
     "0123456789+-=()aehi jklmnoprstuvx".replace(" ", ""),
     "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ",
 )
+
+READING_STATUS_COLORS = {
+    "unread": ("#FDE8E7", "#A83532", "#E5AAA7"),
+    "reading": ("#FFF4CB", "#765600", "#E3C86C"),
+    "read": ("#E5EFFF", "#2457A5", "#9BBBED"),
+}
 
 
 def replace_latex_symbols(value):
@@ -275,6 +303,8 @@ def project_search_context(library, project_id):
     project = library.get_project(project_id)
     if not project:
         return ""
+    if project.get("kind") == "scrapbook":
+        return ""
     if project.get("search_context"):
         return project["search_context"]
 
@@ -305,6 +335,83 @@ def stored_paper_result(paper, pdf_url=None):
         "source": paper.get("metadata_source", ""),
         "citation_count": paper.get("citation_count", 0),
     }
+
+
+def normalize_project_ids(value):
+    """Return distinct project IDs from one ID or a sequence of IDs."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        candidates = value
+    else:
+        candidates = [value]
+    project_ids = []
+    for project_id in candidates:
+        if project_id is not None and project_id not in project_ids:
+            project_ids.append(project_id)
+    return project_ids
+
+
+def reading_status_sort_key(paper):
+    """Put active reading first, followed by unread and completed papers."""
+    order = {"reading": 0, "unread": 1, "read": 2}
+    return (order.get(paper.get("reading_status"), 1), title_sort_key(paper))
+
+
+def paper_card_label(paper):
+    """Keep paper cards consistent after status and favorite changes."""
+    label = latex_to_plain_text(paper["title"])
+    if paper.get("favorite"):
+        label = "★ " + label
+    details = []
+    if paper.get("authors"):
+        details.append(first_author_label(paper["authors"]))
+    if paper.get("year"):
+        details.append(str(paper["year"]))
+    details.append(str(paper.get("reading_status") or "unread").capitalize())
+    return label + "\n" + " · ".join(details)
+
+
+def restore_zoom_choice(combo, value):
+    """Restore a saved fit mode or numeric zoom, falling back to fit width."""
+    target_index = -1
+    for index in range(combo.count()):
+        if str(combo.itemData(index)) == str(value):
+            target_index = index
+            break
+    if target_index < 0:
+        try:
+            zoom = float(value)
+        except (TypeError, ValueError):
+            zoom = 0
+        if 0.25 <= zoom <= 4.0:
+            target_index = combo.findData("custom_zoom", Qt.ItemDataRole.UserRole + 1)
+            if target_index < 0:
+                combo.addItem("", zoom)
+                target_index = combo.count() - 1
+                combo.setItemData(target_index, "custom_zoom", Qt.ItemDataRole.UserRole + 1)
+            combo.setItemText(target_index, f"{zoom * 100:.0f}%")
+            combo.setItemData(target_index, zoom)
+        else:
+            target_index = 0
+    combo.setCurrentIndex(target_index)
+
+
+def pdf_paths_from_mime_data(mime_data, require_exists=True):
+    """Return local PDF paths carried by a drag operation."""
+    paths = []
+    if not mime_data.hasUrls():
+        return paths
+    for url in mime_data.urls():
+        if not url.isLocalFile():
+            continue
+        path = url.toLocalFile()
+        if not path.lower().endswith(".pdf"):
+            continue
+        if require_exists and not os.path.isfile(path):
+            continue
+        paths.append(path)
+    return paths
 
 
 def stop_application(signum=None, frame=None):
@@ -339,6 +446,22 @@ def apply_light_theme(application):
     palette.setColor(QPalette.ColorRole.Light, QColor("#ffffff"))
     palette.setColor(QPalette.ColorRole.Link, QColor("#4d3b8d"))
     application.setPalette(palette)
+    application.setStyleSheet(
+        "QScrollBar:vertical { background: transparent; width: 10px; margin: 0; border: 0; }"
+        "QScrollBar::handle:vertical { background: #BFC3CF; border-radius: 3px; "
+        "min-height: 28px; margin: 0 2px; }"
+        "QScrollBar::handle:vertical:hover { background: #9C94B2; }"
+        "QScrollBar::handle:vertical:pressed { background: #7660BD; }"
+        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; border: 0; }"
+        "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
+        "QScrollBar:horizontal { background: transparent; height: 10px; margin: 0; border: 0; }"
+        "QScrollBar::handle:horizontal { background: #BFC3CF; border-radius: 3px; "
+        "min-width: 28px; margin: 2px 0; }"
+        "QScrollBar::handle:horizontal:hover { background: #9C94B2; }"
+        "QScrollBar::handle:horizontal:pressed { background: #7660BD; }"
+        "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; border: 0; }"
+        "QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }"
+    )
 
 
 class ImportSignals(QObject):
@@ -346,26 +469,57 @@ class ImportSignals(QObject):
 
     finished = Signal(list)
     failed = Signal(str)
+    duplicatesFound = Signal(object)
 
 
 class ImportTask(QRunnable):
     """Copy and index a list of PDFs without blocking the Qt event loop."""
 
-    def __init__(self, library_path, project_id, paths):
+    def __init__(
+        self,
+        library_path,
+        project_ids,
+        paths,
+        allow_duplicates=False,
+    ):
         super().__init__()
         self.library_path = library_path
-        self.project_id = project_id
+        self.project_ids = normalize_project_ids(project_ids)
         self.paths = paths
+        self.allow_duplicates = allow_duplicates
         self.signals = ImportSignals()
 
     def run(self):
+        library = None
+        papers = []
         try:
             library = Library(self.library_path)
-            papers = []
+            self.project_ids = library.validate_destination_projects(
+                self.project_ids
+            )
+            if not self.allow_duplicates:
+                duplicates = []
+                for path in self.paths:
+                    duplicates.extend(
+                        library.find_pdf_duplicates(self.project_ids, path)
+                    )
+                if duplicates:
+                    self.signals.duplicatesFound.emit(
+                        {
+                            "duplicates": duplicates,
+                            "paths": self.paths,
+                            "project_ids": self.project_ids,
+                        }
+                    )
+                    return
             for path in self.paths:
-                papers.append(library.import_pdf(self.project_id, path))
+                for project_id in self.project_ids:
+                    papers.append(library.import_pdf(project_id, path))
             self.signals.finished.emit(papers)
         except Exception as error:
+            if library is not None:
+                for paper in papers:
+                    library.delete_paper(paper["id"])
             self.signals.failed.emit(str(error))
 
 
@@ -443,17 +597,17 @@ class BibtexTask(QRunnable):
 class DownloadSignals(QObject):
     """Signals emitted by a background PDF download and import task."""
 
-    finished = Signal(dict)
+    finished = Signal(object)
     failed = Signal(str)
 
 
 class DownloadTask(QRunnable):
     """Download one direct PDF, import it, and apply its online metadata."""
 
-    def __init__(self, library_path, project_id, result, config, paper_id=None):
+    def __init__(self, library_path, project_ids, result, config, paper_id=None):
         super().__init__()
         self.library_path = library_path
-        self.project_id = project_id
+        self.project_ids = normalize_project_ids(project_ids)
         self.result = result
         self.config = config
         self.paper_id = paper_id
@@ -461,6 +615,8 @@ class DownloadTask(QRunnable):
 
     def run(self):
         temporary_path = ""
+        papers = []
+        library = None
         try:
             pdf_url = self.result.get("pdf_url", "")
             if not pdf_url:
@@ -477,12 +633,29 @@ class DownloadTask(QRunnable):
 
             library = Library(self.library_path)
             if self.paper_id is None:
-                paper = library.import_pdf(self.project_id, temporary_path)
+                self.project_ids = library.validate_destination_projects(
+                    self.project_ids
+                )
+                for project_id in self.project_ids:
+                    paper = library.import_pdf(project_id, temporary_path)
+                    papers.append(paper)
+                    paper = library.update_paper_metadata(
+                        paper["id"],
+                        self.result,
+                    )
+                    papers[-1] = paper
             else:
                 paper = library.attach_pdf(self.paper_id, temporary_path)
-            paper = library.update_paper_metadata(paper["id"], self.result)
-            self.signals.finished.emit(paper)
+                paper = library.update_paper_metadata(
+                    paper["id"],
+                    self.result,
+                )
+                papers.append(paper)
+            self.signals.finished.emit(papers)
         except Exception as error:
+            if self.paper_id is None and library is not None:
+                for paper in papers:
+                    library.delete_paper(paper["id"])
             self.signals.failed.emit(str(error))
         finally:
             if temporary_path and os.path.exists(temporary_path):
@@ -635,6 +808,567 @@ class BibtexDialog(QDialog):
             QDesktopServices.openUrl(QUrl(google_scholar_url(title)))
 
 
+class ComboPopupStyle(QProxyStyle):
+    """Use a styled list popup instead of the platform's menu-like combo popup."""
+
+    def styleHint(self, hint, option=None, widget=None, return_data=None):
+        if hint == QStyle.StyleHint.SH_ComboBox_Popup:
+            return 0
+        if hint == QStyle.StyleHint.SH_ComboBox_PopupFrameStyle:
+            return int(QFrame.Shape.NoFrame)
+        return super().styleHint(hint, option, widget, return_data)
+
+
+class ModernComboBox(QComboBox):
+    """Keep native combo interaction with a light control and soft list menu."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.popup_style = ComboPopupStyle("Fusion")
+        self.popup_style.setParent(self)
+        self.setStyle(self.popup_style)
+        self.setView(QListView())
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        arrow = os.path.join(os.path.dirname(__file__), "assets", "chevron-down.svg")
+        self.setStyleSheet(
+            "QComboBox { background: #FFFFFF; color: #242528; border: 1px solid #DCDEE5; "
+            "border-radius: 8px; padding: 5px 30px 5px 10px; min-height: 20px; }"
+            "QComboBox:hover { border-color: #B8B0CE; }"
+            "QComboBox:focus { border-color: #927DCB; }"
+            "QComboBox:disabled { background: #F3F3F5; color: #A4A6AC; }"
+            "QComboBox::drop-down { border: 0; width: 24px; margin-right: 4px; }"
+            'QComboBox::down-arrow { image: url("' + arrow + '"); width: 12px; height: 12px; }'
+        )
+        self.view().setStyleSheet(
+            "QListView { background: transparent; color: #242528; border: 0; "
+            "padding: 5px; outline: 0; font-size: 13px; font-weight: 400; }"
+            "QListView::item { min-height: 24px; padding: 5px 10px; "
+            "border: 0; border-radius: 5px; color: #242528; }"
+            "QListView::item:hover { background: #F5F3FA; }"
+            "QListView::item:selected { background: #EFEBFA; color: #574697; }"
+        )
+        popup = self.view().window()
+        popup.setObjectName("comboPopup")
+        popup.setFrameShape(QFrame.Shape.NoFrame)
+        popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        popup.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if watched.objectName() == "comboPopup" and event.type() == QEvent.Type.Paint:
+            painter = QPainter(watched)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            painter.fillRect(watched.rect(), Qt.GlobalColor.transparent)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setBrush(QColor("#FFFFFF"))
+            painter.setPen(QColor("#E0DDE8"))
+            painter.drawRoundedRect(QRectF(watched.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 9, 9)
+            return True
+        return super().eventFilter(watched, event)
+
+
+class ProjectCardDelegate(QStyledItemDelegate):
+    """Paint selection backgrounds while the card widgets draw their labels."""
+
+    def paint(self, painter, option, index):
+        option = QStyleOptionViewItem(option)
+        self.initStyleOption(option, index)
+        option.text = ""
+        widget = option.widget
+        widget.style().drawControl(QStyle.ControlElement.CE_ItemViewItem, option, painter, widget)
+
+
+class ProjectListWidget(QListWidget):
+    """Keep project labels fully wrapped beside their favorite controls."""
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        for index in range(self.count()):
+            item = self.item(index)
+            card = self.itemWidget(item)
+            if card is not None and card.objectName() == "projectCard":
+                height = max(card.sizeHint().height(), card.heightForWidth(self.viewport().width()))
+                item.setSizeHint(QSize(0, height))
+
+
+class ReadingStatusCombo(ModernComboBox):
+    """Keep the native status menu, with a centered label and visible chevron."""
+
+    def content_geometry(self):
+        """Center the visible text ink and chevron as one balanced group."""
+        font = self.font()
+        font.setPixelSize(12)
+        font.setWeight(QFont.Weight.Medium)
+        ink = QFontMetricsF(font).tightBoundingRect(self.currentText())
+        rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        gap = 8
+        arrow_width = 7.25
+        group_width = ink.width() + gap + arrow_width
+        left = rect.center().x() - group_width / 2
+        label_position = QPointF(left - ink.left(), rect.center().y() - ink.center().y())
+        arrow_center = QPointF(left + ink.width() + gap + arrow_width / 2, rect.center().y())
+        return font, label_position, arrow_center
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        background, foreground, border = READING_STATUS_COLORS.get(
+            self.currentData(), READING_STATUS_COLORS["unread"]
+        )
+        if not self.isEnabled():
+            background, foreground, border = "#F3F3F5", "#848691", "#DCDEE3"
+        painter.setBrush(QColor(background))
+        if self.hasFocus() or self.underMouse():
+            painter.setPen(QPen(QColor(border), 1))
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+        rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        painter.drawRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+        painter.setPen(QColor(foreground))
+        font, label_position, arrow_center = self.content_geometry()
+        painter.setFont(font)
+        painter.drawText(label_position, self.currentText())
+        x = arrow_center.x()
+        y = arrow_center.y()
+        pen = QPen(QColor(foreground), 1.25)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.drawLine(QPointF(x - 3, y - 1.5), QPointF(x, y + 1.5))
+        painter.drawLine(QPointF(x, y + 1.5), QPointF(x + 3, y - 1.5))
+
+
+class ZoomablePdfView(QPdfView):
+    """Add trackpad pinch and modified-wheel zoom without changing plain scroll."""
+
+    customZoomChanged = Signal(float)
+
+    def effective_zoom(self):
+        if self.zoomMode() == QPdfView.ZoomMode.Custom:
+            return self.zoomFactor()
+        page = max(0, self.pageNavigator().currentPage())
+        size = self.document().pagePointSize(page)
+        margins = self.documentMargins()
+        width = max(1, self.viewport().width() - margins.left() - margins.right())
+        height = max(1, self.viewport().height() - margins.top() - margins.bottom())
+        zoom = width / max(1, size.width())
+        if self.zoomMode() == QPdfView.ZoomMode.FitInView:
+            zoom = min(zoom, height / max(1, size.height()))
+        return zoom
+
+    def scale_zoom(self, multiplier):
+        if self.document() is None or self.document().pageCount() <= 0:
+            return
+        if multiplier <= 0:
+            return
+        navigator = self.pageNavigator()
+        page = max(0, navigator.currentPage())
+        location = navigator.currentLocation()
+        zoom = round(max(0.25, min(4.0, self.effective_zoom() * multiplier)), 4)
+        self.setZoomMode(QPdfView.ZoomMode.Custom)
+        self.setZoomFactor(zoom)
+        navigator.jump(page, location)
+        self.customZoomChanged.emit(zoom)
+
+    def zoom_in(self):
+        self.scale_zoom(1.2)
+
+    def zoom_out(self):
+        self.scale_zoom(1 / 1.2)
+
+    def wheelEvent(self, event):
+        modifiers = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier
+        if event.modifiers() & modifiers:
+            delta = event.angleDelta().y()
+            if delta == 0:
+                delta = event.pixelDelta().y()
+            self.scale_zoom(1.2 ** (max(-240, min(240, delta)) / 120))
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def viewportEvent(self, event):
+        if event.type() == QEvent.Type.NativeGesture:
+            if event.gestureType() == Qt.NativeGestureType.ZoomNativeGesture:
+                self.scale_zoom(1 + event.value())
+                event.accept()
+                return True
+        return super().viewportEvent(event)
+
+
+class PaperCardDelegate(QStyledItemDelegate):
+    """Measure and draw wrapped paper cards with separate status pills."""
+
+    def card_document(self, option, index, width):
+        paper = index.data(Qt.ItemDataRole.UserRole + 1) or {}
+        title = latex_to_plain_text(paper.get("title", ""))
+        title_html = html.escape(title)
+        if paper.get("favorite"):
+            title_html = '<span style="color:#D9A000;">★</span> ' + title_html
+        details = []
+        if paper.get("authors"):
+            details.append(first_author_label(paper["authors"]))
+        if paper.get("year"):
+            details.append(str(paper["year"]))
+        color = "#202124"
+        if option.state & QStyle.StateFlag.State_Selected:
+            color = "#443381"
+        document = QTextDocument()
+        document.setDocumentMargin(0)
+        document.setDefaultFont(self.parent().font())
+        document.setHtml(
+            '<div style="color:' + color + '; font-weight:600;">'
+            + title_html + '</div>'
+            + '<div style="color:#656871;">'
+            + html.escape(" · ".join(details)) + '</div>'
+        )
+        document.setTextWidth(max(40, width - 28))
+        return document
+
+    def sizeHint(self, option, index):
+        option = QStyleOptionViewItem(option)
+        self.initStyleOption(option, index)
+        width = max(68, self.parent().viewport().width() - 4)
+        document = self.card_document(option, index, width - 4)
+        return QSize(width, math.ceil(document.size().height()) + 62)
+
+    def paint(self, painter, option, index):
+        painter.save()
+        painter.setRenderHint(painter.RenderHint.Antialiasing)
+        rect = QRectF(option.rect).adjusted(2, 1, -2, -7)
+        background = "#FFFFFF"
+        border = "#E0E1E5"
+        if option.state & QStyle.StateFlag.State_Selected:
+            background = "#EEEAFF"
+            border = "#A99BE0"
+        elif option.state & QStyle.StateFlag.State_MouseOver:
+            border = "#BDBFC5"
+        painter.setBrush(QColor(background))
+        painter.setPen(QColor(border))
+        painter.drawRoundedRect(rect, 8, 8)
+        document = self.card_document(option, index, rect.width())
+        painter.save()
+        painter.translate(rect.left() + 14, rect.top() + 12)
+        document.drawContents(painter)
+        painter.restore()
+        paper = index.data(Qt.ItemDataRole.UserRole + 1) or {}
+        status = paper.get("reading_status") or "unread"
+        background, foreground, border = READING_STATUS_COLORS.get(
+            status, READING_STATUS_COLORS["unread"]
+        )
+        label = status.capitalize()
+        font = self.parent().font()
+        font.setBold(True)
+        painter.setFont(font)
+        pill = QRectF(
+            rect.left() + 14, rect.top() + 20 + document.size().height(),
+            painter.fontMetrics().horizontalAdvance(label) + 24, 24,
+        )
+        painter.setBrush(QColor(background))
+        painter.setPen(QColor(border))
+        painter.drawRoundedRect(pill, 12, 12)
+        painter.setPen(QColor(foreground))
+        painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, label)
+        painter.restore()
+
+
+class PdfDropListWidget(QListWidget):
+    """Accept local PDF drops across the current project's paper list."""
+
+    pdfsDropped = Signal(object)
+    dragActiveChanged = Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.drop_enabled = False
+        self.drag_active = False
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.setDropIndicatorShown(False)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.doItemsLayout()
+
+    def set_drop_enabled(self, enabled):
+        self.drop_enabled = bool(enabled)
+        if not self.drop_enabled:
+            self.set_drag_active(False)
+
+    def set_drag_active(self, active):
+        active = bool(active)
+        if active == self.drag_active:
+            return
+        self.drag_active = active
+        self.setProperty("dragActive", bool(active))
+        if active:
+            self.setStyleSheet(
+                "QListWidget#paperList { background: #f4f1ff; "
+                "border: 2px dashed #806cc8; border-radius: 9px; }"
+            )
+        else:
+            self.setStyleSheet("")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.viewport().update()
+        self.dragActiveChanged.emit(active)
+
+    def dragEnterEvent(self, event):
+        paths = pdf_paths_from_mime_data(event.mimeData(), False)
+        if self.drop_enabled and paths:
+            self.set_drag_active(True)
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        paths = pdf_paths_from_mime_data(event.mimeData(), False)
+        if self.drop_enabled and paths:
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            self.set_drag_active(False)
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.set_drag_active(False)
+        event.accept()
+
+    def dropEvent(self, event):
+        paths = pdf_paths_from_mime_data(event.mimeData())
+        self.set_drag_active(False)
+        if not self.drop_enabled or not paths:
+            event.ignore()
+            return
+        self.pdfsDropped.emit(paths)
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+
+
+class PdfDropPanel(QWidget):
+    """Accept local PDF drops on the surrounding Papers pane."""
+
+    pdfsDropped = Signal(object)
+    dragActiveChanged = Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.drop_enabled = False
+        self.drag_active = False
+        self.setAcceptDrops(True)
+
+    def set_drop_enabled(self, enabled):
+        self.drop_enabled = bool(enabled)
+        if not self.drop_enabled:
+            self.set_drag_active(False)
+
+    def set_drag_active(self, active):
+        active = bool(active)
+        if active == self.drag_active:
+            return
+        self.drag_active = active
+        self.setProperty("dragActive", bool(active))
+        if active:
+            self.setStyleSheet(
+                "QWidget#paperPanel { background: #f4f1ff; "
+                "border: 2px dashed #806cc8; }"
+            )
+        else:
+            self.setStyleSheet("")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+        self.dragActiveChanged.emit(active)
+
+    def dragEnterEvent(self, event):
+        paths = pdf_paths_from_mime_data(event.mimeData(), False)
+        if self.drop_enabled and paths:
+            self.set_drag_active(True)
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        paths = pdf_paths_from_mime_data(event.mimeData(), False)
+        if self.drop_enabled and paths:
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            self.set_drag_active(False)
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.set_drag_active(False)
+        event.accept()
+
+    def dropEvent(self, event):
+        paths = pdf_paths_from_mime_data(event.mimeData())
+        self.set_drag_active(False)
+        if not self.drop_enabled or not paths:
+            event.ignore()
+            return
+        self.pdfsDropped.emit(paths)
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+
+
+class AddPaperDialog(QDialog):
+    """Offer the two clear ways to add a paper to one project."""
+
+    def __init__(self, parent, project, online_enabled):
+        super().__init__(parent)
+        self.choice = ""
+        self.setWindowTitle("Add paper")
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+        heading = QLabel("Add a paper to " + project["name"])
+        heading.setObjectName("homeSectionHeading")
+        layout.addWidget(heading)
+        description = QLabel(
+            "Choose a PDF from your computer, or find a paper online by "
+            "title, DOI, arXiv URL, or project-page link."
+        )
+        description.setWordWrap(True)
+        description.setObjectName("mutedLabel")
+        layout.addWidget(description)
+
+        self.upload_button = QPushButton("Add PDF from computer…")
+        self.upload_button.setMinimumHeight(48)
+        self.upload_button.clicked.connect(self.choose_upload)
+        layout.addWidget(self.upload_button)
+
+        self.online_button = QPushButton("Search or paste a link…")
+        self.online_button.setMinimumHeight(48)
+        self.online_button.setEnabled(online_enabled)
+        self.online_button.clicked.connect(self.choose_online)
+        layout.addWidget(self.online_button)
+
+        if not online_enabled:
+            offline_label = QLabel(
+                "Online search is unavailable right now. You can still add "
+                "a local PDF."
+            )
+            offline_label.setObjectName("mutedLabel")
+            offline_label.setWordWrap(True)
+            layout.addWidget(offline_label)
+
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        layout.addWidget(cancel_button, alignment=Qt.AlignmentFlag.AlignRight)
+
+    def choose_upload(self):
+        self.choice = "upload"
+        self.accept()
+
+    def choose_online(self):
+        self.choice = "online"
+        self.accept()
+
+
+class ProjectSelectionDialog(QDialog):
+    """Choose one or more destination projects with visible locked entries."""
+
+    def __init__(
+        self,
+        parent,
+        projects,
+        selected_ids=None,
+        locked_ids=None,
+        exclusive_ids=None,
+        require_unlocked_selection=True,
+        title="Choose projects",
+        prompt="Choose where independent copies should be created.",
+    ):
+        super().__init__(parent)
+        if selected_ids is None:
+            selected_ids = []
+        if locked_ids is None:
+            locked_ids = []
+        if exclusive_ids is None:
+            exclusive_ids = []
+        self.locked_ids = set(locked_ids)
+        self.exclusive_ids = set(exclusive_ids)
+        self.changing_checks = False
+        self.require_unlocked_selection = require_unlocked_selection
+        self.setWindowTitle(title)
+        self.resize(430, 360)
+
+        layout = QVBoxLayout(self)
+        prompt_label = QLabel(prompt)
+        prompt_label.setWordWrap(True)
+        layout.addWidget(prompt_label)
+
+        self.project_list = QListWidget()
+        for project in projects:
+            item = QListWidgetItem(project["name"])
+            item.setData(Qt.ItemDataRole.UserRole, project["id"])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            if project["id"] in selected_ids:
+                item.setCheckState(Qt.CheckState.Checked)
+            else:
+                item.setCheckState(Qt.CheckState.Unchecked)
+            if project["id"] in self.locked_ids:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+            self.project_list.addItem(item)
+        layout.addWidget(self.project_list)
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+        self.project_list.itemChanged.connect(self.project_check_changed)
+        self.update_accept_button()
+
+    def selected_project_ids(self):
+        project_ids = []
+        for index in range(self.project_list.count()):
+            item = self.project_list.item(index)
+            if item.checkState() == Qt.CheckState.Checked:
+                project_ids.append(item.data(Qt.ItemDataRole.UserRole))
+        return project_ids
+
+    def update_accept_button(self, item=None):
+        enabled = True
+        if self.require_unlocked_selection:
+            enabled = False
+            for project_id in self.selected_project_ids():
+                if project_id not in self.locked_ids:
+                    enabled = True
+                    break
+        button = self.button_box.button(
+            QDialogButtonBox.StandardButton.Ok
+        )
+        button.setEnabled(enabled)
+
+    def project_check_changed(self, changed_item):
+        if self.changing_checks:
+            return
+        if changed_item.checkState() != Qt.CheckState.Checked:
+            self.update_accept_button()
+            return
+
+        changed_id = changed_item.data(Qt.ItemDataRole.UserRole)
+        self.changing_checks = True
+        for index in range(self.project_list.count()):
+            item = self.project_list.item(index)
+            project_id = item.data(Qt.ItemDataRole.UserRole)
+            if changed_id in self.exclusive_ids:
+                if project_id != changed_id:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+            elif project_id in self.exclusive_ids:
+                item.setCheckState(Qt.CheckState.Unchecked)
+        self.changing_checks = False
+        self.update_accept_button()
+
+
 class DiscoveryDialog(QDialog):
     """Search online sources and add a confirmed result to any project."""
 
@@ -656,6 +1390,8 @@ class DiscoveryDialog(QDialog):
     ):
         super().__init__(parent)
         self.results = []
+        self.projects = list(projects)
+        self.additional_project_ids = []
         self.paper_id = paper_id
         self.config = config
         self.apply_callback = apply_callback
@@ -671,7 +1407,7 @@ class DiscoveryDialog(QDialog):
         if self.pdf_target:
             self.setWindowTitle("Find an online PDF")
         else:
-            self.setWindowTitle("Search online")
+            self.setWindowTitle("Add paper online")
         self.resize(860, 560)
         self.build_ui(projects, project_id)
 
@@ -687,7 +1423,7 @@ class DiscoveryDialog(QDialog):
         self.query_input.setText(self.initial_query)
         self.query_input.returnPressed.connect(self.start_search)
         search_layout.addWidget(self.query_input)
-        self.search_button = QPushButton("Search")
+        self.search_button = QPushButton("Find paper")
         self.search_button.clicked.connect(self.start_search)
         search_layout.addWidget(self.search_button)
         layout.addLayout(search_layout)
@@ -697,15 +1433,22 @@ class DiscoveryDialog(QDialog):
             destination_layout.addWidget(QLabel("Selected paper is in"))
         else:
             destination_layout.addWidget(QLabel("Add to"))
-        self.project_combo = QComboBox()
+        self.project_combo = ModernComboBox()
         selected_index = 0
         for index, project in enumerate(projects):
-            self.project_combo.addItem(project["name"], project["id"])
+            project_name = project["name"]
+            if project.get("kind") == "scrapbook":
+                project_name += " · temporary"
+            self.project_combo.addItem(project_name, project["id"])
             if project["id"] == project_id:
                 selected_index = index
         self.project_combo.setCurrentIndex(selected_index)
         self.project_combo.setEnabled(not self.pdf_target)
         destination_layout.addWidget(self.project_combo)
+        self.more_projects_button = QPushButton("Add to more projects…")
+        self.more_projects_button.clicked.connect(self.choose_more_projects)
+        self.more_projects_button.setVisible(not self.pdf_target)
+        destination_layout.addWidget(self.more_projects_button)
         self.new_project_button = QPushButton("+ New project")
         self.new_project_button.clicked.connect(self.create_project)
         destination_layout.addWidget(self.new_project_button)
@@ -733,7 +1476,7 @@ class DiscoveryDialog(QDialog):
         self.project_changed()
 
         self.status_label = QLabel(
-            "Search online sources, then review a result before adding it."
+            "Search by title or paste an arXiv, DOI, or project-page link."
         )
         self.status_label.setStyleSheet("color: #666666;")
         layout.addWidget(self.status_label)
@@ -819,7 +1562,9 @@ class DiscoveryDialog(QDialog):
     def start_search(self):
         title = self.query_input.text().strip()
         if not title:
-            self.status_label.setText("Enter a paper title or identifier.")
+            self.status_label.setText(
+                "Enter a paper title, DOI, arXiv ID, or link."
+            )
             return
 
         context = self.context_input.text().strip()
@@ -829,6 +1574,7 @@ class DiscoveryDialog(QDialog):
         self.search_button.setEnabled(False)
         self.query_input.setEnabled(False)
         self.project_combo.setEnabled(False)
+        self.more_projects_button.setEnabled(False)
         self.new_project_button.setEnabled(False)
         self.context_input.setEnabled(False)
         self.result_list.clear()
@@ -858,6 +1604,7 @@ class DiscoveryDialog(QDialog):
         self.search_button.setEnabled(True)
         self.query_input.setEnabled(True)
         self.project_combo.setEnabled(not self.pdf_target)
+        self.update_more_projects_button()
         self.new_project_button.setEnabled(True)
         self.context_input.setEnabled(True)
         self.progress_bar.setVisible(False)
@@ -910,6 +1657,7 @@ class DiscoveryDialog(QDialog):
         self.search_button.setEnabled(True)
         self.query_input.setEnabled(True)
         self.project_combo.setEnabled(not self.pdf_target)
+        self.update_more_projects_button()
         self.new_project_button.setEnabled(True)
         self.context_input.setEnabled(True)
         self.progress_bar.setVisible(False)
@@ -917,6 +1665,12 @@ class DiscoveryDialog(QDialog):
 
     def project_changed(self, index=None):
         project_id = self.project_combo.currentData()
+        project = self.primary_project()
+        if project and project.get("kind") == "scrapbook":
+            self.additional_project_ids = []
+        if project_id in self.additional_project_ids:
+            self.additional_project_ids.remove(project_id)
+        self.update_more_projects_button()
         context = ""
         if self.context_callback:
             context = self.context_callback(project_id)
@@ -934,8 +1688,74 @@ class DiscoveryDialog(QDialog):
         if not project:
             return
         self.project_combo.addItem(project["name"], project["id"])
+        self.projects.append(project)
         self.project_combo.setCurrentIndex(self.project_combo.count() - 1)
         self.status_label.setText("Created project " + project["name"] + ".")
+
+    def destination_project_ids(self):
+        project_ids = []
+        primary_project_id = self.project_combo.currentData()
+        if primary_project_id is not None:
+            project_ids.append(primary_project_id)
+        primary_project = self.primary_project()
+        if primary_project and primary_project.get("kind") == "scrapbook":
+            return project_ids
+        for project_id in self.additional_project_ids:
+            if project_id not in project_ids:
+                project_ids.append(project_id)
+        return project_ids
+
+    def choose_more_projects(self):
+        primary_project_id = self.project_combo.currentData()
+        selected_ids = self.destination_project_ids()
+        standard_projects = []
+        for project in self.projects:
+            if project.get("kind") != "scrapbook":
+                standard_projects.append(project)
+        dialog = ProjectSelectionDialog(
+            self,
+            standard_projects,
+            selected_ids=selected_ids,
+            locked_ids=[primary_project_id],
+            require_unlocked_selection=False,
+            title="Add to more projects",
+            prompt=(
+                "The primary project is locked because it supplies search "
+                "preferences. Select any additional projects that should "
+                "receive independent copies."
+            ),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected_ids = dialog.selected_project_ids()
+        self.additional_project_ids = []
+        for project_id in selected_ids:
+            if project_id != primary_project_id:
+                self.additional_project_ids.append(project_id)
+        self.update_more_projects_button()
+        self.set_actions_enabled(self.selected_result() is not None)
+
+    def update_more_projects_button(self):
+        primary_project = self.primary_project()
+        if primary_project and primary_project.get("kind") == "scrapbook":
+            self.more_projects_button.setText("ScrapBook is exclusive")
+            self.more_projects_button.setEnabled(False)
+            return
+        self.more_projects_button.setEnabled(not self.pdf_target)
+        count = len(self.additional_project_ids)
+        if count == 0:
+            self.more_projects_button.setText("Add to more projects…")
+        elif count == 1:
+            self.more_projects_button.setText("+ 1 more project")
+        else:
+            self.more_projects_button.setText("+ " + str(count) + " more projects")
+
+    def primary_project(self):
+        project_id = self.project_combo.currentData()
+        for project in self.projects:
+            if project["id"] == project_id:
+                return project
+        return None
 
     def selected_result(self):
         item = self.result_list.currentItem()
@@ -1044,17 +1864,18 @@ class DiscoveryDialog(QDialog):
     def add_selected(self):
         result = self.selected_result()
         if result and self.add_callback:
-            project_id = self.project_combo.currentData()
-            if self.add_callback(result, project_id):
+            project_ids = self.destination_project_ids()
+            if self.add_callback(result, project_ids):
+                count = len(project_ids)
                 self.status_label.setText(
-                    "Citation saved to " + self.project_combo.currentText()
+                    "Citation copied to " + str(count) + " project(s)"
                 )
 
     def download_selected(self):
         result = self.selected_result()
         if result and self.download_callback:
-            project_id = self.project_combo.currentData()
-            if self.download_callback(result, project_id):
+            project_ids = self.destination_project_ids()
+            if self.download_callback(result, project_ids):
                 self.accept()
 
     def open_source(self):
@@ -1082,6 +1903,357 @@ class DiscoveryDialog(QDialog):
         url = result.get("project_url", "")
         if url:
             QDesktopServices.openUrl(QUrl(url))
+
+
+class PdfCommentsPanel(QWidget):
+    """Create and navigate app-side comments anchored to PDF pages."""
+
+    def __init__(self, library, paper_id, navigator, parent=None):
+        super().__init__(parent)
+        self.library = library
+        self.paper_id = paper_id
+        self.navigator = navigator
+        self.setObjectName("pdfCommentsPanel")
+        self.setMinimumWidth(240)
+        self.setMaximumWidth(360)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        heading = QLabel("PDF comments")
+        heading.setObjectName("paneHeading")
+        layout.addWidget(heading)
+        self.page_label = QLabel("Commenting on page 1")
+        self.page_label.setObjectName("mutedLabel")
+        layout.addWidget(self.page_label)
+
+        self.editor = QPlainTextEdit()
+        self.editor.setPlaceholderText(
+            "Write a comment about the page you are viewing…"
+        )
+        self.editor.setMaximumHeight(100)
+        layout.addWidget(self.editor)
+        self.add_button = QPushButton("Add comment")
+        self.add_button.clicked.connect(self.add_comment)
+        layout.addWidget(self.add_button)
+
+        self.comment_list = QListWidget()
+        self.comment_list.setObjectName("pdfCommentList")
+        self.comment_list.setWordWrap(True)
+        self.comment_list.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.comment_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.comment_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.comment_list.itemClicked.connect(self.jump_to_comment)
+        self.comment_list.currentItemChanged.connect(
+            self.comment_selection_changed
+        )
+        layout.addWidget(self.comment_list, 1)
+
+        self.delete_button = QPushButton("Delete selected comment")
+        self.delete_button.setObjectName("deleteButton")
+        self.delete_button.clicked.connect(self.delete_selected_comment)
+        layout.addWidget(self.delete_button)
+        note = QLabel(
+            "Comments stay in Corpus Cabinet; the original PDF is unchanged."
+        )
+        note.setObjectName("mutedLabel")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.navigator.currentPageChanged.connect(self.current_page_changed)
+        self.refresh()
+
+    def set_context(self, library, paper_id):
+        self.library = library
+        self.paper_id = paper_id
+        self.editor.clear()
+        self.refresh()
+
+    def current_page_number(self):
+        try:
+            current_page = self.navigator.currentPage()
+        except RuntimeError:
+            return 1
+        if current_page < 0:
+            current_page = 0
+        return current_page + 1
+
+    def current_page_changed(self, page=None):
+        self.page_label.setText(
+            "Commenting on page " + str(self.current_page_number())
+        )
+
+    def refresh(self):
+        self.comment_list.clear()
+        enabled = self.library is not None and self.paper_id is not None
+        self.editor.setEnabled(enabled)
+        self.add_button.setEnabled(enabled)
+        self.delete_button.setEnabled(False)
+        self.current_page_changed()
+        if not enabled:
+            return
+        for comment in self.library.list_paper_comments(self.paper_id):
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, comment["id"])
+            item.setData(Qt.ItemDataRole.UserRole + 1, comment["page_number"])
+            item.setToolTip(comment["body"])
+            approximate_lines = (len(comment["body"]) + 27) // 28
+            if approximate_lines < 1:
+                approximate_lines = 1
+            if approximate_lines > 5:
+                approximate_lines = 5
+            item.setSizeHint(QSize(0, 42 + approximate_lines * 20))
+            self.comment_list.addItem(item)
+            self.comment_list.setItemWidget(
+                item,
+                self.create_comment_card(comment),
+            )
+
+    def create_comment_card(self, comment):
+        """Build a readable, wrapping card for one PDF comment."""
+        card = QWidget()
+        card.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(2)
+        page_label = QLabel("Page " + str(comment["page_number"]))
+        page_label.setStyleSheet("font-weight: 600;")
+        layout.addWidget(page_label)
+        body_label = QLabel(comment["body"])
+        body_label.setWordWrap(True)
+        layout.addWidget(body_label)
+        return card
+
+    def comment_selection_changed(self, current, previous=None):
+        self.delete_button.setEnabled(current is not None)
+
+    def add_comment(self):
+        if self.library is None or self.paper_id is None:
+            return
+        body = self.editor.toPlainText().strip()
+        if not body:
+            return
+        try:
+            self.library.create_paper_comment(
+                self.paper_id,
+                self.current_page_number(),
+                body,
+            )
+        except ValueError as error:
+            QMessageBox.warning(self, "Cannot add comment", str(error))
+            return
+        self.editor.clear()
+        self.refresh()
+
+    def delete_selected_comment(self):
+        item = self.comment_list.currentItem()
+        if item is None or self.library is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete comment",
+            "Delete this PDF comment?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.library.delete_paper_comment(
+            item.data(Qt.ItemDataRole.UserRole)
+        )
+        self.refresh()
+
+    def jump_to_comment(self, item):
+        page_number = item.data(Qt.ItemDataRole.UserRole + 1)
+        if page_number is None:
+            return
+        self.navigator.jump(int(page_number) - 1, QPointF())
+
+
+class FullscreenPdfDialog(QDialog):
+    """Distraction-free multi-page PDF reader with explicit exit controls."""
+
+    def __init__(
+        self,
+        parent,
+        file_path,
+        title,
+        initial_page=0,
+        library=None,
+        paper_id=None,
+        initial_zoom="fit_width",
+    ):
+        super().__init__(parent)
+        self.library = library
+        self.paper_id = paper_id
+        self.loading = True
+        self.setWindowTitle(title)
+        self.document = QPdfDocument(self)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 16)
+        toolbar_layout = QHBoxLayout()
+        reader_title = QLabel(latex_to_plain_text(title))
+        reader_title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        reader_title.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        toolbar_layout.addWidget(reader_title)
+        toolbar_layout.addStretch()
+        self.previous_button = QPushButton("Previous")
+        self.previous_button.clicked.connect(self.go_to_previous_page)
+        toolbar_layout.addWidget(self.previous_button)
+        self.page_label = QLabel("Page - of -")
+        self.page_label.setObjectName("mutedLabel")
+        toolbar_layout.addWidget(self.page_label)
+        self.next_button = QPushButton("Next")
+        self.next_button.clicked.connect(self.go_to_next_page)
+        toolbar_layout.addWidget(self.next_button)
+        self.comments_button = QPushButton("Comments")
+        self.comments_button.setCheckable(True)
+        self.comments_button.setChecked(True)
+        toolbar_layout.addWidget(self.comments_button)
+        toolbar_layout.addWidget(QLabel("Zoom"))
+        self.zoom_combo = ModernComboBox()
+        self.zoom_combo.addItem("Fit width", "fit_width")
+        self.zoom_combo.addItem("Fit page", "fit_page")
+        self.zoom_combo.addItem("100%", 1.0)
+        self.zoom_combo.addItem("125%", 1.25)
+        self.zoom_combo.addItem("150%", 1.5)
+        self.zoom_combo.currentIndexChanged.connect(self.change_zoom)
+        toolbar_layout.addWidget(self.zoom_combo)
+        self.zoom_out_button = QPushButton("−")
+        self.zoom_out_button.setToolTip("Zoom out")
+        toolbar_layout.addWidget(self.zoom_out_button)
+        self.zoom_in_button = QPushButton("+")
+        self.zoom_in_button.setToolTip("Zoom in · trackpad pinch or Ctrl/Cmd + scroll also works")
+        toolbar_layout.addWidget(self.zoom_in_button)
+        self.exit_button = QPushButton("Exit full screen")
+        self.exit_button.clicked.connect(self.accept)
+        toolbar_layout.addWidget(self.exit_button)
+        layout.addLayout(toolbar_layout)
+
+        self.view = ZoomablePdfView()
+        self.zoom_out_button.clicked.connect(self.view.zoom_out)
+        self.zoom_in_button.clicked.connect(self.view.zoom_in)
+        self.view.customZoomChanged.connect(self.sync_custom_zoom)
+        self.view.setDocument(self.document)
+        self.view.setPageMode(QPdfView.PageMode.MultiPage)
+        self.view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        reader_splitter = QSplitter(Qt.Orientation.Horizontal)
+        reader_splitter.addWidget(self.view)
+        self.comments_panel = PdfCommentsPanel(
+            library,
+            paper_id,
+            self.view.pageNavigator(),
+        )
+        reader_splitter.addWidget(self.comments_panel)
+        reader_splitter.setStretchFactor(0, 1)
+        reader_splitter.setSizes([900, 300])
+        self.comments_button.toggled.connect(
+            self.comments_panel.setVisible
+        )
+        self.comments_panel.setVisible(
+            library is not None and paper_id is not None
+        )
+        self.comments_button.setVisible(
+            library is not None and paper_id is not None
+        )
+        layout.addWidget(reader_splitter, 1)
+
+        self.document.pageCountChanged.connect(self.update_page_controls)
+        self.view.pageNavigator().currentPageChanged.connect(
+            self.update_page_controls
+        )
+        self.view.pageNavigator().currentPageChanged.connect(self.save_reader_state)
+        self.escape_shortcut = QShortcut(QKeySequence("Escape"), self)
+        self.escape_shortcut.activated.connect(self.reject)
+
+        self.document.load(file_path)
+        restore_zoom_choice(self.zoom_combo, initial_zoom)
+        self.change_zoom()
+        if initial_page > 0 and initial_page < self.document.pageCount():
+            self.view.pageNavigator().jump(initial_page, QPointF())
+        self.update_page_controls()
+        self.loading = False
+        self.save_reader_state()
+
+    def update_page_controls(self, value=None):
+        """Update the full-screen reader's page counter and buttons."""
+        page_count = self.document.pageCount()
+        current_page = self.view.pageNavigator().currentPage()
+        if page_count <= 0:
+            self.page_label.setText("Page - of -")
+            self.previous_button.setEnabled(False)
+            self.next_button.setEnabled(False)
+            self.zoom_combo.setEnabled(False)
+            self.zoom_out_button.setEnabled(False)
+            self.zoom_in_button.setEnabled(False)
+            return
+        if current_page < 0:
+            current_page = 0
+        self.page_label.setText(
+            "Page " + str(current_page + 1) + " of " + str(page_count)
+        )
+        self.previous_button.setEnabled(current_page > 0)
+        self.next_button.setEnabled(current_page < page_count - 1)
+        self.zoom_combo.setEnabled(True)
+        self.zoom_out_button.setEnabled(True)
+        self.zoom_in_button.setEnabled(True)
+
+    def go_to_previous_page(self):
+        """Move the full-screen reader to the preceding page."""
+        navigator = self.view.pageNavigator()
+        target_page = navigator.currentPage() - 1
+        if target_page >= 0:
+            navigator.jump(target_page, QPointF())
+
+    def go_to_next_page(self):
+        """Move the full-screen reader to the following page."""
+        navigator = self.view.pageNavigator()
+        target_page = navigator.currentPage() + 1
+        if target_page < self.document.pageCount():
+            navigator.jump(target_page, QPointF())
+
+    def sync_custom_zoom(self, zoom):
+        self.zoom_combo.blockSignals(True)
+        restore_zoom_choice(self.zoom_combo, zoom)
+        self.zoom_combo.blockSignals(False)
+        self.save_reader_state()
+
+    def change_zoom(self, index=None):
+        """Apply the selected fit or fixed zoom mode."""
+        zoom = self.zoom_combo.currentData()
+        if zoom == "fit_width":
+            self.view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        elif zoom == "fit_page":
+            self.view.setZoomMode(QPdfView.ZoomMode.FitInView)
+        elif zoom is not None:
+            self.view.setZoomMode(QPdfView.ZoomMode.Custom)
+            self.view.setZoomFactor(float(zoom))
+        self.save_reader_state()
+
+    def save_reader_state(self, page=None):
+        if self.loading or self.library is None or self.paper_id is None:
+            return
+        if self.document.pageCount() <= 0:
+            return
+        try:
+            self.library.save_reader_state(
+                self.paper_id,
+                self.current_page(),
+                self.zoom_combo.currentData(),
+            )
+        except Exception:
+            self.page_label.setToolTip("Reading position could not be saved.")
+
+    def done(self, result):
+        self.save_reader_state()
+        super().done(result)
+
+    def current_page(self):
+        """Return the page visible when the reader closes."""
+        return self.view.pageNavigator().currentPage()
 
 
 class MainWindow(QMainWindow):
@@ -1112,6 +2284,20 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self.current_project_id = None
         self.current_paper_id = None
+        self.pdf_metadata_attempted = set()
+        self.notes_paper_id = None
+        self.notes_dirty = False
+        self.notes_save_timer = QTimer(self)
+        self.notes_save_timer.setSingleShot(True)
+        self.notes_save_timer.setInterval(600)
+        self.notes_save_timer.timeout.connect(self.save_pending_notes)
+        self.reader_paper_id = None
+        self.loading_pdf = False
+        self.reader_dirty = False
+        self.reader_save_timer = QTimer(self)
+        self.reader_save_timer.setSingleShot(True)
+        self.reader_save_timer.setInterval(500)
+        self.reader_save_timer.timeout.connect(self.save_pending_reader_state)
         self.pdf_document = QPdfDocument(self)
 
         self.setWindowTitle("Corpus Cabinet")
@@ -1145,28 +2331,21 @@ class MainWindow(QMainWindow):
         self.library_view_button.setCheckable(True)
         self.library_view_button.clicked.connect(self.show_library)
         header_layout.addWidget(self.library_view_button)
+        self.library_search_button = QPushButton("Search library")
+        self.library_search_button.setObjectName("quietButton")
+        self.library_search_button.setToolTip(
+            "Search your saved papers, notes, and PDF comments (Cmd/Ctrl+F)."
+        )
+        self.library_search_button.clicked.connect(self.open_library_search)
+        header_layout.addWidget(self.library_search_button)
+        self.library_search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        self.library_search_shortcut.activated.connect(self.open_library_search)
         header_layout.addStretch()
         self.network_status_label = QLabel()
         self.network_status_label.setObjectName("networkStatus")
         header_layout.addWidget(self.network_status_label)
-        self.discover_button = QPushButton("Add online")
-        self.discover_button.setObjectName("discoverButton")
-        self.discover_button.setToolTip(
-            "Search scholarly sources or add a paper from a link (Cmd/Ctrl+K)"
-        )
-        self.online_add_menu = QMenu(self.discover_button)
-        self.search_online_action = self.online_add_menu.addAction(
-            "Search by title…"
-        )
-        self.search_online_action.triggered.connect(self.discover_papers)
-        self.add_link_action = self.online_add_menu.addAction(
-            "Add from link…"
-        )
-        self.add_link_action.triggered.connect(self.add_from_link)
-        self.discover_button.setMenu(self.online_add_menu)
-        header_layout.addWidget(self.discover_button)
         self.discover_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
-        self.discover_shortcut.activated.connect(self.discover_papers)
+        self.discover_shortcut.activated.connect(self.open_add_paper)
         self.offline_mode_checkbox = QCheckBox("Work offline")
         self.offline_mode_checkbox.setChecked(self.user_offline_mode)
         self.offline_mode_checkbox.toggled.connect(self.toggle_offline_mode)
@@ -1186,9 +2365,13 @@ class MainWindow(QMainWindow):
         library_layout = QVBoxLayout(self.library_page)
         library_layout.setContentsMargins(0, 0, 0, 0)
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.library_splitter = splitter
         splitter.addWidget(self.build_project_panel())
         splitter.addWidget(self.build_paper_panel())
         splitter.addWidget(self.build_detail_panel())
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 0)
+        splitter.setStretchFactor(2, 1)
         splitter.setSizes([230, 360, 690])
         library_layout.addWidget(splitter)
         self.page_stack.addWidget(self.home_page)
@@ -1257,18 +2440,28 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(stats_layout)
 
+        reading_heading = QLabel("Recently opened")
+        reading_heading.setObjectName("homeSectionHeading")
+        layout.addWidget(reading_heading)
+        self.home_reading_list = QListWidget()
+        self.home_reading_list.setObjectName("homeRecentList")
+        self.home_reading_list.setMaximumHeight(150)
+        self.home_reading_list.itemClicked.connect(self.resume_home_paper)
+        layout.addWidget(self.home_reading_list)
+
         recent_heading = QLabel("Continue a project")
         recent_heading.setObjectName("homeSectionHeading")
         layout.addWidget(recent_heading)
         self.home_recent_list = QListWidget()
         self.home_recent_list.setObjectName("homeRecentList")
-        self.home_recent_list.setMaximumHeight(190)
+        self.home_recent_list.setMaximumHeight(130)
         self.home_recent_list.itemClicked.connect(self.open_home_project)
         layout.addWidget(self.home_recent_list)
         layout.addStretch()
         return page
 
     def show_home(self):
+        self.save_pending_reader_state()
         self.page_stack.setCurrentWidget(self.home_page)
         self.home_button.setChecked(True)
         self.library_view_button.setChecked(False)
@@ -1283,12 +2476,32 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "home_recent_list"):
             return
         projects = self.library.list_projects()
+        standard_projects = []
+        for project in projects:
+            if project.get("kind") != "scrapbook":
+                standard_projects.append(project)
         papers = self.library.list_papers()
-        self.home_project_count.setText(str(len(projects)))
+        self.home_project_count.setText(str(len(standard_projects)))
         self.home_paper_count.setText(str(len(papers)))
 
+        self.home_reading_list.clear()
+        for paper in self.library.recent_reading_papers():
+            label = (
+                latex_to_plain_text(paper["title"]) + "\n"
+                + paper["project_name"] + " · Page "
+                + str(paper.get("last_page", 0) + 1) + " · "
+                + str(paper.get("reading_status") or "unread").capitalize()
+            )
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, paper["id"])
+            self.home_reading_list.addItem(item)
+        if not self.home_reading_list.count():
+            item = QListWidgetItem("Open a PDF to start your reading history.")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.home_reading_list.addItem(item)
+
         self.home_recent_list.clear()
-        for project in projects[:5]:
+        for project in standard_projects[:5]:
             paper_count = project.get("paper_count", 0)
             suffix = " papers"
             if paper_count == 1:
@@ -1297,7 +2510,7 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, project["id"])
             self.home_recent_list.addItem(item)
-        if not projects:
+        if not standard_projects:
             item = QListWidgetItem(
                 "No projects yet — create one when you have a direction to follow."
             )
@@ -1314,6 +2527,184 @@ class MainWindow(QMainWindow):
             if project_item.data(Qt.ItemDataRole.UserRole) == project_id:
                 self.project_list.setCurrentItem(project_item)
                 return
+
+    def navigate_to_paper(self, paper_id):
+        """Reveal one independent paper copy in its owning project."""
+        paper = self.library.get_paper(paper_id)
+        if not paper:
+            return False
+        self.save_pending_notes()
+        self.save_pending_reader_state()
+        self.show_library()
+        for index in range(self.project_list.count()):
+            item = self.project_list.item(index)
+            if item.data(Qt.ItemDataRole.UserRole) == paper["project_id"]:
+                self.project_list.setCurrentItem(item)
+                break
+        self.select_paper_by_id(paper_id)
+        return self.current_paper_id == paper_id
+
+    def resume_home_paper(self, item):
+        paper_id = item.data(Qt.ItemDataRole.UserRole)
+        if paper_id is not None and self.navigate_to_paper(paper_id):
+            self.detail_tabs.setCurrentWidget(self.pdf_tab)
+            self.detail_tab_changed(self.detail_tabs.indexOf(self.pdf_tab))
+
+    def open_library_search(self, checked=False, query=""):
+        """Keep local retrieval separate from online paper acquisition."""
+        self.save_pending_notes()
+        self.save_pending_reader_state()
+        dialog = LibrarySearchDialog(self, self.library)
+        if query:
+            dialog.query_input.setText(query)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        paper = dialog.selected_paper
+        if not paper or not self.navigate_to_paper(paper["id"]):
+            return
+        field = paper.get("match_field")
+        if field == "notes":
+            self.detail_tabs.setCurrentWidget(self.notes_tab)
+        elif field in ("extracted_text", "pdf_comment"):
+            self.detail_tabs.setCurrentWidget(self.pdf_tab)
+            page_number = paper.get("match_page_number")
+            if page_number and self.pdf_document.pageCount() > 0:
+                page = min(page_number - 1, self.pdf_document.pageCount() - 1)
+                self.pdf_view.pageNavigator().jump(page, QPointF())
+        else:
+            self.detail_tabs.setCurrentIndex(0)
+
+    def open_project_notes(self):
+        if self.current_project_id is None:
+            return
+        project = self.library.get_project(self.current_project_id)
+        if project:
+            dialog = ProjectNotesDialog(self, self.library, project)
+            dialog.exec()
+
+    def edit_paper_tags(self):
+        if self.current_paper_id is None:
+            return
+        tags = self.library.list_paper_tags(self.current_paper_id)
+        text, accepted = QInputDialog.getText(
+            self, "Paper tags", "Separate tags with commas, e.g. robotics, latent actions.\n"
+            "Remove a tag here to unlink it from this paper.",
+            QLineEdit.EchoMode.Normal, ", ".join(tags),
+        )
+        if not accepted:
+            return
+        try:
+            tags = self.library.update_paper_tags(self.current_paper_id, text)
+        except Exception as error:
+            QMessageBox.warning(self, "Tags could not be saved", str(error))
+            return
+        self.render_paper_tags(tags)
+        self.statusBar().showMessage("Tags saved", 3000)
+
+    def render_paper_tags(self, tags=None):
+        self.tags_button.setEnabled(self.current_paper_id is not None)
+        tags = tags or []
+        if tags:
+            self.tags_button.setText("Edit tags")
+        else:
+            self.tags_button.setText("+ Add tags")
+        links = []
+        for tag in tags:
+            links.append(
+                '<a style="color:#6350AA; text-decoration:none;" href="tag:'
+                + quote(tag, safe="") + '">#' + html.escape(tag) + '</a>'
+            )
+        self.paper_tags_label.setText(" &nbsp; · &nbsp; ".join(links))
+        self.paper_tags_label.setVisible(bool(tags))
+
+    def search_paper_tag(self, link):
+        tag = unquote(link.removeprefix("tag:"))
+        self.open_library_search(query="tag:" + json.dumps(tag, ensure_ascii=False))
+
+    def render_reading_controls(self, paper=None):
+        self.reading_status_combo.blockSignals(True)
+        self.favorite_button.blockSignals(True)
+        self.reading_status_combo.setEnabled(paper is not None)
+        self.favorite_button.setEnabled(paper is not None)
+        status = "unread"
+        favorite = False
+        if paper:
+            status = paper.get("reading_status") or "unread"
+            favorite = bool(paper.get("favorite"))
+        index = self.reading_status_combo.findData(status)
+        self.reading_status_combo.setCurrentIndex(max(index, 0))
+        self.style_reading_status(status)
+        self.favorite_button.setChecked(favorite)
+        if favorite:
+            self.favorite_button.setText("★")
+            self.favorite_button.setToolTip("Remove from favorites")
+            self.favorite_button.setAccessibleName("Remove from favorites")
+        else:
+            self.favorite_button.setText("☆")
+            self.favorite_button.setToolTip("Add to favorites")
+            self.favorite_button.setAccessibleName("Add to favorites")
+        self.reading_status_combo.blockSignals(False)
+        self.favorite_button.blockSignals(False)
+
+    def style_reading_status(self, status):
+        background, _, border = READING_STATUS_COLORS.get(
+            status, READING_STATUS_COLORS["unread"]
+        )
+        self.reading_status_combo.setStyleSheet(
+            f"""
+            QComboBox#readingStatusPill {{
+                background: {background}; color: #242528;
+                border: 1px solid {border}; border-radius: 16px;
+                padding: 0px 28px 0px 14px; font-weight: 600;
+            }}
+            QComboBox#readingStatusPill::drop-down {{
+                border: none; width: 24px;
+            }}
+            QComboBox#readingStatusPill:disabled {{
+                background: #F3F3F5; color: #848691; border-color: #DCDEE3;
+            }}
+            QComboBox#readingStatusPill QAbstractItemView {{
+                background: white; color: #242528;
+                selection-background-color: #EFEBFF;
+                selection-color: #443381;
+            }}
+            """
+        )
+
+    def change_reading_status(self, index=None):
+        if self.current_paper_id is None:
+            return
+        self.library.update_reading_status(
+            self.current_paper_id,
+            self.reading_status_combo.currentData(),
+        )
+        self.style_reading_status(self.reading_status_combo.currentData())
+        self.refresh_reading_labels()
+        if self.sort_combo.currentData() == "reading_status":
+            self.refresh_papers()
+
+    def change_paper_favorite(self, favorite):
+        if self.current_paper_id is None:
+            return
+        self.library.update_paper_favorite(self.current_paper_id, favorite)
+        if favorite:
+            self.favorite_button.setText("★")
+            self.favorite_button.setToolTip("Remove from favorites")
+            self.favorite_button.setAccessibleName("Remove from favorites")
+        else:
+            self.favorite_button.setText("☆")
+            self.favorite_button.setToolTip("Add to favorites")
+            self.favorite_button.setAccessibleName("Add to favorites")
+        self.refresh_reading_labels()
+
+    def refresh_reading_labels(self):
+        for index in range(self.paper_list.count()):
+            item = self.paper_list.item(index)
+            paper = self.library.get_paper(item.data(Qt.ItemDataRole.UserRole))
+            if paper:
+                item.setText(paper_card_label(paper))
+                item.setData(Qt.ItemDataRole.UserRole + 1, paper)
+        self.refresh_home()
 
     def apply_product_styles(self):
         """Apply the intentionally light product shell."""
@@ -1335,9 +2726,6 @@ class MainWindow(QMainWindow):
             "background: #ffffff; color: #202124; }"
             "QPushButton:hover { background: #f1f1f3; }"
             "QPushButton:disabled { color: #a4a6ac; background: #f3f3f4; }"
-            "QPushButton#discoverButton { min-height: 30px; border: 0; "
-            "background: #6350aa; color: #ffffff; font-weight: 600; }"
-            "QPushButton#discoverButton:hover { background: #574697; }"
             "QPushButton#quietButton { background: transparent; }"
             "QWidget#homePage { background: #fbfbfc; }"
             "QLabel#homeEyebrow { color: #6350aa; font-weight: 700; }"
@@ -1367,23 +2755,24 @@ class MainWindow(QMainWindow):
             "background: #f2f2f4; }"
             "QWidget#projectPanel { border-right: 1px solid #dedfe2; }"
             "QWidget#paperPanel { border-right: 1px solid #dedfe2; }"
+            "QWidget#paperPanel[dragActive=\"true\"] { "
+            "background: #f4f1ff; border: 2px dashed #806cc8; }"
+            "QLabel#paperDropHint { padding: 10px; border-radius: 7px; "
+            "background: #6350aa; color: #ffffff; font-weight: 700; }"
             "QWidget#detailPanel { background: #ffffff; }"
             "QLabel#paneHeading { font-size: 13px; font-weight: 700; "
             "color: #202124; }"
             "QSplitter::handle { background: #dedfe2; width: 1px; }"
             "QListWidget#projectList, QListWidget#paperList { border: 0; "
             "outline: 0; background: transparent; }"
-            "QListWidget#projectList::item { padding: 9px; margin-bottom: 3px; "
+            "QListWidget#projectList::item { padding: 0; margin-bottom: 3px; "
             "border-radius: 7px; color: #202124; }"
             "QListWidget#projectList::item:hover { background: #e9e9ec; }"
             "QListWidget#projectList::item:selected { background: #e8e3ff; "
             "color: #443381; }"
-            "QListWidget#paperList::item { padding: 10px; margin-bottom: 5px; "
-            "border: 1px solid #e0e1e5; border-radius: 7px; "
-            "background: #ffffff; color: #202124; }"
-            "QListWidget#paperList::item:hover { border-color: #bdbfc5; }"
-            "QListWidget#paperList::item:selected { background: #eeeaff; "
-            "color: #443381; border-color: #a99be0; }"
+            "QListWidget#paperList[dragActive=\"true\"] { "
+            "background: #f4f1ff; border: 2px dashed #806cc8; "
+            "border-radius: 9px; }"
             "QComboBox, QLineEdit, QPlainTextEdit { border: 1px solid #ced0d5; "
             "border-radius: 6px; padding: 5px; background: #ffffff; "
             "color: #202124; selection-background-color: #6350aa; "
@@ -1399,6 +2788,14 @@ class MainWindow(QMainWindow):
             "QTabBar::tab:selected { color: #443381; background: #ffffff; "
             "border-bottom-color: #ffffff; }"
             "QWidget#pdfEmptyPanel { background: #f7f7f8; border-radius: 9px; }"
+            "QWidget#pdfCommentsPanel { background: #f7f7f8; "
+            "border-left: 1px solid #dedfe2; }"
+            "QListWidget#pdfCommentList { border: 1px solid #dedfe2; "
+            "border-radius: 7px; background: #ffffff; outline: 0; }"
+            "QListWidget#pdfCommentList::item { padding: 9px; "
+            "border-bottom: 1px solid #ececef; }"
+            "QListWidget#pdfCommentList::item:selected { "
+            "background: #eeeaff; color: #443381; }"
             "QLabel#pdfEmptyMark { min-width: 46px; min-height: 46px; "
             "max-width: 46px; max-height: 46px; border-radius: 23px; "
             "background: #e8e3ff; color: #443381; font-weight: 700; }"
@@ -1423,13 +2820,22 @@ class MainWindow(QMainWindow):
         heading.setObjectName("paneHeading")
         layout.addWidget(heading)
 
-        self.project_list = QListWidget()
+        self.project_list = ProjectListWidget()
         self.project_list.setObjectName("projectList")
+        self.project_list.setItemDelegate(ProjectCardDelegate(self.project_list))
         self.project_list.setSpacing(2)
         self.project_list.currentItemChanged.connect(self.select_project)
+        self.project_list.currentItemChanged.connect(
+            self.update_project_card_selection
+        )
         self.project_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.project_list.customContextMenuRequested.connect(self.project_context_menu)
         layout.addWidget(self.project_list)
+
+        self.project_notes_button = QPushButton("Project notes…")
+        self.project_notes_button.setEnabled(False)
+        self.project_notes_button.clicked.connect(self.open_project_notes)
+        layout.addWidget(self.project_notes_button)
 
         self.new_project_button = QPushButton("+ New project")
         self.new_project_button.clicked.connect(self.create_project)
@@ -1437,8 +2843,11 @@ class MainWindow(QMainWindow):
         return panel
 
     def build_paper_panel(self):
-        panel = QWidget()
+        panel = PdfDropPanel()
+        self.paper_panel = panel
         panel.setObjectName("paperPanel")
+        panel.pdfsDropped.connect(self.confirm_dropped_pdfs)
+        panel.dragActiveChanged.connect(self.show_paper_drop_hint)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(14, 16, 14, 14)
         heading_layout = QHBoxLayout()
@@ -1449,24 +2858,37 @@ class MainWindow(QMainWindow):
         self.paper_count_label = QLabel("0 papers")
         self.paper_count_label.setObjectName("mutedLabel")
         heading_layout.addWidget(self.paper_count_label)
-        self.sort_combo = QComboBox()
+        self.sort_combo = ModernComboBox()
         self.sort_combo.addItem("Recently added", "created")
         self.sort_combo.addItem("Title A–Z", "title")
         self.sort_combo.addItem("Publication date", "publication")
         self.sort_combo.addItem("Author", "author")
+        self.sort_combo.addItem("Reading status", "reading_status")
         self.sort_combo.currentIndexChanged.connect(self.refresh_papers)
         heading_layout.addWidget(self.sort_combo)
         layout.addLayout(heading_layout)
 
-        self.import_button = QPushButton("Import PDFs")
-        self.import_button.setText("+ Import PDFs")
-        self.import_button.clicked.connect(self.choose_pdfs)
-        self.import_button.setEnabled(False)
-        layout.addWidget(self.import_button)
+        self.add_paper_button = QPushButton("+ Add paper")
+        self.add_paper_button.setToolTip(
+            "Add a PDF, search by title, or paste a paper link (Cmd/Ctrl+K)"
+        )
+        self.add_paper_button.clicked.connect(self.open_add_paper)
+        self.add_paper_button.setEnabled(False)
+        layout.addWidget(self.add_paper_button)
 
-        self.paper_list = QListWidget()
+        self.paper_drop_hint = QLabel("Drop PDF to add to this project")
+        self.paper_drop_hint.setObjectName("paperDropHint")
+        self.paper_drop_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.paper_drop_hint.setVisible(False)
+        layout.addWidget(self.paper_drop_hint)
+
+        self.paper_list = PdfDropListWidget()
         self.paper_list.setObjectName("paperList")
+        self.paper_list.setItemDelegate(PaperCardDelegate(self.paper_list))
+        self.paper_list.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.paper_list.setSpacing(2)
+        self.paper_list.pdfsDropped.connect(self.confirm_dropped_pdfs)
+        self.paper_list.dragActiveChanged.connect(self.show_paper_drop_hint)
         self.paper_list.setWordWrap(True)
         self.paper_list.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
@@ -1474,6 +2896,18 @@ class MainWindow(QMainWindow):
         self.paper_list.currentItemChanged.connect(self.select_paper)
         layout.addWidget(self.paper_list)
         return panel
+
+    def show_paper_drop_hint(self, active):
+        """Show the current destination while a PDF is over the Papers pane."""
+        if not active or self.current_project_id is None:
+            self.paper_drop_hint.setVisible(False)
+            return
+        project = self.library.get_project(self.current_project_id)
+        if not project:
+            self.paper_drop_hint.setVisible(False)
+            return
+        self.paper_drop_hint.setText("Drop PDF to add to " + project["name"])
+        self.paper_drop_hint.setVisible(True)
 
     def build_detail_panel(self):
         panel = QWidget()
@@ -1484,30 +2918,210 @@ class MainWindow(QMainWindow):
         self.detail_title = QLabel("Select a paper")
         self.detail_title.setWordWrap(True)
         self.detail_title.setTextFormat(Qt.TextFormat.RichText)
+        self.detail_title.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
         self.detail_title.setStyleSheet("font-size: 18px; font-weight: 600;")
         layout.addWidget(self.detail_title)
 
+        reading_layout = QHBoxLayout()
+        reading_layout.setSpacing(8)
+        self.reading_status_combo = ReadingStatusCombo()
+        self.reading_status_combo.setObjectName("readingStatusPill")
+        self.reading_status_combo.setFixedSize(108, 28)
+        self.reading_status_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.reading_status_combo.setToolTip("Click to change reading status")
+        self.reading_status_combo.setAccessibleName("Change reading status")
+        self.reading_status_combo.addItem("Unread", "unread")
+        self.reading_status_combo.addItem("Reading", "reading")
+        self.reading_status_combo.addItem("Read", "read")
+        self.reading_status_combo.setEnabled(False)
+        self.reading_status_combo.currentIndexChanged.connect(self.change_reading_status)
+        reading_layout.addWidget(self.reading_status_combo)
+        self.favorite_button = QPushButton("☆")
+        self.favorite_button.setObjectName("paperFavoriteButton")
+        self.favorite_button.setFixedSize(28, 28)
+        self.favorite_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.favorite_button.setToolTip("Add to favorites")
+        self.favorite_button.setAccessibleName("Add to favorites")
+        self.favorite_button.setStyleSheet(
+            "QPushButton#paperFavoriteButton { min-height: 0; border: 0; "
+            "border-radius: 14px; padding: 0; background: transparent; "
+            "color: #848691; font-size: 20px; }"
+            "QPushButton#paperFavoriteButton:hover { background: #FFF7DB; color: #B88400; }"
+            "QPushButton#paperFavoriteButton:checked { color: #D9A000; }"
+            "QPushButton#paperFavoriteButton:focus { border: 1px solid #D9A000; }"
+            "QPushButton#paperFavoriteButton:disabled { color: #A4A6AC; }"
+        )
+        self.favorite_button.setCheckable(True)
+        self.favorite_button.setEnabled(False)
+        self.favorite_button.toggled.connect(self.change_paper_favorite)
+        reading_layout.addWidget(self.favorite_button)
+        self.tags_button = QPushButton("+ Add tags")
+        self.tags_button.setObjectName("paperReferenceButton")
+        self.tags_button.setFixedHeight(28)
+        self.tags_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.tags_button.setToolTip("Organize this paper with searchable tags")
+        self.tags_button.clicked.connect(self.edit_paper_tags)
+        self.tags_button.setStyleSheet(
+            "QPushButton#paperReferenceButton { min-height: 0; border: 0; "
+            "border-radius: 5px; padding: 0 8px; background: transparent; color: #6350AA; font-size: 12px; }"
+            "QPushButton#paperReferenceButton:hover { background: #F3F1FA; }"
+            "QPushButton#paperReferenceButton:focus { border: 1px solid #A99BE0; }"
+            "QPushButton#paperReferenceButton:disabled { color: #A4A6AC; }"
+        )
+        reading_layout.addWidget(self.tags_button)
+        reading_layout.addStretch()
+        layout.addLayout(reading_layout)
+
         self.detail_tabs = QTabWidget()
+        self.detail_tabs.setObjectName("paperDetailTabs")
+        self.detail_tabs.setStyleSheet(
+            "QTabWidget#paperDetailTabs::pane { border: 0; "
+            "border-top: 1px solid #E8E9ED; border-radius: 0; background: #FFFFFF; }"
+            "QTabWidget#paperDetailTabs QTabBar::tab { border: 0; "
+            "border-bottom: 2px solid transparent; background: transparent; "
+            "padding: 10px 14px; margin-right: 8px; color: #74777F; }"
+            "QTabWidget#paperDetailTabs QTabBar::tab:hover { color: #443381; }"
+            "QTabWidget#paperDetailTabs QTabBar::tab:selected { "
+            "border-bottom: 2px solid #7660BD; color: #574697; }"
+        )
         self.detail_tabs.addTab(self.build_detail_tab(), "Details")
+        self.notes_tab = self.build_notes_tab()
         pdf_panel = QWidget()
         pdf_layout = QVBoxLayout(pdf_panel)
         pdf_layout.setContentsMargins(14, 14, 14, 14)
+        self.pdf_toolbar = QWidget()
+        pdf_toolbar_layout = QVBoxLayout(self.pdf_toolbar)
+        pdf_toolbar_layout.setContentsMargins(0, 0, 0, 6)
+        pdf_navigation_layout = QHBoxLayout()
+        pdf_toolbar_layout.addLayout(pdf_navigation_layout)
+        self.pdf_previous_button = QPushButton("Previous")
+        self.pdf_previous_button.clicked.connect(self.go_to_previous_pdf_page)
+        pdf_navigation_layout.addWidget(self.pdf_previous_button)
+        self.pdf_page_label = QLabel("Page - of -")
+        self.pdf_page_label.setObjectName("mutedLabel")
+        pdf_navigation_layout.addWidget(self.pdf_page_label)
+        self.pdf_next_button = QPushButton("Next")
+        self.pdf_next_button.clicked.connect(self.go_to_next_pdf_page)
+        pdf_navigation_layout.addWidget(self.pdf_next_button)
+        self.pdf_comments_button = QPushButton("Comments")
+        self.pdf_comments_button.setCheckable(True)
+        self.pdf_comments_button.setChecked(True)
+        pdf_navigation_layout.addWidget(self.pdf_comments_button)
+        self.pdf_fullscreen_button = QPushButton("Full screen")
+        self.pdf_fullscreen_button.setToolTip(
+            "Open a distraction-free PDF reader. Press Esc to exit."
+        )
+        self.pdf_fullscreen_button.clicked.connect(self.open_fullscreen_pdf)
+        pdf_navigation_layout.addWidget(self.pdf_fullscreen_button)
+        pdf_navigation_layout.addStretch()
+        pdf_zoom_layout = QHBoxLayout()
+        pdf_toolbar_layout.addLayout(pdf_zoom_layout)
+        pdf_zoom_layout.addWidget(QLabel("Zoom"))
+        self.pdf_zoom_combo = ModernComboBox()
+        self.pdf_zoom_combo.addItem("Fit width", "fit_width")
+        self.pdf_zoom_combo.addItem("Fit page", "fit_page")
+        self.pdf_zoom_combo.addItem("100%", 1.0)
+        self.pdf_zoom_combo.addItem("125%", 1.25)
+        self.pdf_zoom_combo.addItem("150%", 1.5)
+        self.pdf_zoom_combo.currentIndexChanged.connect(self.change_pdf_zoom)
+        pdf_zoom_layout.addWidget(self.pdf_zoom_combo)
+        self.pdf_zoom_out_button = QPushButton("−")
+        self.pdf_zoom_out_button.setToolTip("Zoom out")
+        pdf_zoom_layout.addWidget(self.pdf_zoom_out_button)
+        self.pdf_zoom_in_button = QPushButton("+")
+        self.pdf_zoom_in_button.setToolTip("Zoom in · trackpad pinch or Ctrl/Cmd + scroll also works")
+        pdf_zoom_layout.addWidget(self.pdf_zoom_in_button)
+        pdf_zoom_layout.addStretch()
+        self.pdf_toolbar.setVisible(False)
+        pdf_layout.addWidget(self.pdf_toolbar)
         self.pdf_stack = QStackedWidget()
+        # Fit the reader to its pane instead of letting its size hint move dividers.
+        self.pdf_stack.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.pdf_empty_panel = self.build_pdf_empty_state()
         self.pdf_stack.addWidget(self.pdf_empty_panel)
-        self.pdf_view = QPdfView()
+        self.pdf_view = ZoomablePdfView()
+        self.pdf_zoom_out_button.clicked.connect(self.pdf_view.zoom_out)
+        self.pdf_zoom_in_button.clicked.connect(self.pdf_view.zoom_in)
+        self.pdf_view.customZoomChanged.connect(self.sync_custom_pdf_zoom)
         self.pdf_view.setDocument(self.pdf_document)
+        self.pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
+        self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        self.pdf_document.pageCountChanged.connect(
+            self.update_pdf_page_controls
+        )
+        self.pdf_view.pageNavigator().currentPageChanged.connect(
+            self.update_pdf_page_controls
+        )
+        self.pdf_view.pageNavigator().currentPageChanged.connect(
+            self.schedule_reader_save
+        )
         self.pdf_stack.addWidget(self.pdf_view)
-        pdf_layout.addWidget(self.pdf_stack)
-        self.detail_tabs.addTab(pdf_panel, "PDF")
+        self.pdf_reader_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.pdf_reader_splitter.addWidget(self.pdf_stack)
+        self.pdf_comments_panel = PdfCommentsPanel(
+            self.library,
+            None,
+            self.pdf_view.pageNavigator(),
+        )
+        self.pdf_reader_splitter.addWidget(self.pdf_comments_panel)
+        self.pdf_reader_splitter.setStretchFactor(0, 1)
+        self.pdf_reader_splitter.setSizes([720, 260])
+        self.pdf_comments_button.toggled.connect(
+            self.pdf_comments_panel.setVisible
+        )
+        self.pdf_comments_panel.setVisible(False)
+        pdf_layout.addWidget(self.pdf_reader_splitter, 1)
+        self.pdf_tab = pdf_panel
+        self.detail_tabs.addTab(self.pdf_tab, "PDF")
+        self.detail_tabs.addTab(self.notes_tab, "Notes")
+        self.detail_tabs.currentChanged.connect(self.detail_tab_changed)
         layout.addWidget(self.detail_tabs)
 
+        paper_action_layout = QHBoxLayout()
+        self.copy_paper_button = QPushButton("Copy to project…")
+        self.copy_paper_button.clicked.connect(self.copy_current_paper)
+        self.copy_paper_button.setEnabled(False)
+        paper_action_layout.addWidget(self.copy_paper_button)
         self.delete_paper_button = QPushButton("Delete paper")
         self.delete_paper_button.setObjectName("deleteButton")
         self.delete_paper_button.clicked.connect(self.delete_current_paper)
         self.delete_paper_button.setEnabled(False)
-        layout.addWidget(self.delete_paper_button)
+        paper_action_layout.addWidget(self.delete_paper_button)
+        layout.addLayout(paper_action_layout)
         return panel
+
+    def build_notes_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+
+        heading = QLabel("Personal notes")
+        heading.setObjectName("homeSectionHeading")
+        layout.addWidget(heading)
+        description = QLabel(
+            "Write observations, questions, or reminders about this paper."
+        )
+        description.setObjectName("mutedLabel")
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        self.notes_editor = QPlainTextEdit()
+        self.notes_editor.setObjectName("notesEditor")
+        self.notes_editor.setPlaceholderText(
+            "Select a paper, then start writing…"
+        )
+        self.notes_editor.setEnabled(False)
+        self.notes_editor.textChanged.connect(self.schedule_notes_save)
+        layout.addWidget(self.notes_editor, 1)
+
+        self.notes_status_label = QLabel("Select a paper to add notes.")
+        self.notes_status_label.setObjectName("mutedLabel")
+        layout.addWidget(self.notes_status_label)
+        return tab
 
     def build_pdf_empty_state(self):
         panel = QWidget()
@@ -1577,8 +3191,14 @@ class MainWindow(QMainWindow):
     def build_detail_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 16, 0, 0)
+        layout.setSpacing(12)
         self.detail_meta = QLabel()
         self.detail_meta.setWordWrap(True)
+        self.detail_meta.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
         self.detail_meta.setObjectName("mutedLabel")
         layout.addWidget(self.detail_meta)
 
@@ -1601,8 +3221,31 @@ class MainWindow(QMainWindow):
         )
         self.bibtex_button.clicked.connect(self.open_bibtex_dialog)
         link_layout.addWidget(self.bibtex_button)
+        for button in (self.open_source_button, self.scholar_button, self.bibtex_button):
+            button.setObjectName("paperReferenceButton")
+            button.setFixedHeight(28)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet(
+                "QPushButton#paperReferenceButton { min-height: 0; border: 0; "
+                "border-radius: 5px; padding: 0 8px; background: transparent; "
+                "color: #6350AA; font-size: 12px; }"
+                "QPushButton#paperReferenceButton:hover { background: #F3F1FA; }"
+                "QPushButton#paperReferenceButton:focus { border: 1px solid #A99BE0; }"
+                "QPushButton#paperReferenceButton:disabled { color: #A4A6AC; }"
+            )
+        link_layout.setSpacing(8)
         link_layout.addStretch()
         layout.addLayout(link_layout)
+
+        self.paper_tags_label = QLabel()
+        self.paper_tags_label.setWordWrap(True)
+        self.paper_tags_label.setTextFormat(Qt.TextFormat.RichText)
+        self.paper_tags_label.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByKeyboard)
+        self.paper_tags_label.setToolTip("Click a tag to find matching papers across your library")
+        self.paper_tags_label.linkActivated.connect(self.search_paper_tag)
+        self.paper_tags_label.setVisible(False)
+        layout.addWidget(self.paper_tags_label)
 
         abstract_heading_layout = QHBoxLayout()
         self.abstract_label = QLabel("Abstract")
@@ -1671,7 +3314,10 @@ class MainWindow(QMainWindow):
         self.update_network_status()
         self.update_search_controls()
         self.refresh_projects()
-        self.import_button.setEnabled(self.current_project_id is not None)
+        self.add_paper_button.setEnabled(
+            self.current_project_id is not None
+            and not self.online_controls_busy
+        )
 
     def update_network_status(self):
         if self.user_offline_mode:
@@ -1692,13 +3338,12 @@ class MainWindow(QMainWindow):
             self.network_status_label.setToolTip("Internet access is available.")
 
     def update_search_controls(self):
-        if not hasattr(self, "discover_button"):
-            return
-        online_enabled = (
-            not self.offline_mode and not self.online_controls_busy
+        add_enabled = (
+            self.current_project_id is not None
+            and not self.online_controls_busy
         )
-        self.discover_button.setEnabled(online_enabled)
-        self.discover_shortcut.setEnabled(online_enabled)
+        self.add_paper_button.setEnabled(add_enabled)
+        self.discover_shortcut.setEnabled(add_enabled)
         self.update_paper_link_controls()
         if self.current_paper_id is not None:
             paper = self.library.get_paper(self.current_paper_id)
@@ -1792,12 +3437,28 @@ class MainWindow(QMainWindow):
             paper_suffix = " papers"
             if paper_count == 1:
                 paper_suffix = " paper"
-            label = (
-                project["name"] + "\n" + str(paper_count) + paper_suffix
-            )
+            label = project["name"] + "\n" + str(paper_count) + paper_suffix
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, project["id"])
+            if project.get("kind") == "scrapbook":
+                item.setData(Qt.ItemDataRole.UserRole + 1, "scrapbook")
+                item.setSizeHint(QSize(0, 82))
+                item.setToolTip(
+                    "Temporary holding area. Papers move out instead of being copied."
+                )
             self.project_list.addItem(item)
+            if project.get("kind") == "scrapbook":
+                scrapbook_card = self.create_scrapbook_card(
+                    paper_count,
+                    paper_suffix,
+                    project,
+                )
+                self.project_list.setItemWidget(item, scrapbook_card)
+            else:
+                card = self.create_project_card(project, paper_count, paper_suffix)
+                card.ensurePolished()
+                item.setSizeHint(QSize(0, max(card.sizeHint().height(), card.heightForWidth(self.project_list.viewport().width()))))
+                self.project_list.setItemWidget(item, card)
             if project["id"] == selected_id:
                 target_row = index
         self.project_list.blockSignals(False)
@@ -1809,9 +3470,150 @@ class MainWindow(QMainWindow):
             self.project_list.setCurrentRow(target_row)
         else:
             self.current_project_id = None
-            self.import_button.setEnabled(False)
+            self.add_paper_button.setEnabled(False)
+            self.project_notes_button.setEnabled(False)
+            self.paper_panel.set_drop_enabled(False)
+            self.paper_list.set_drop_enabled(False)
             self.refresh_papers()
         self.refresh_home()
+
+    def create_project_favorite_button(self, project):
+        button = QPushButton()
+        button.setObjectName("projectFavoriteButton")
+        button.setProperty("projectId", project["id"])
+        button.setCheckable(True)
+        button.setFixedSize(28, 28)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setStyleSheet(
+            "QPushButton#projectFavoriteButton { min-height: 0; border: 0; "
+            "border-radius: 14px; padding: 0; background: transparent; "
+            "color: #848691; font-size: 20px; }"
+            "QPushButton#projectFavoriteButton:hover { background: #FFF7DB; color: #B88400; }"
+            "QPushButton#projectFavoriteButton:checked { color: #D9A000; }"
+            "QPushButton#projectFavoriteButton:focus { border: 1px solid #D9A000; }"
+        )
+        button.setChecked(bool(project.get("favorite")))
+        self.render_project_favorite_button(button)
+        button.clicked.connect(self.change_project_favorite)
+        return button
+
+    def render_project_favorite_button(self, button):
+        if button.isChecked():
+            button.setText("★")
+            action = "Remove project from favorites"
+        else:
+            button.setText("☆")
+            action = "Add project to favorites"
+        button.setToolTip(action)
+        button.setAccessibleName(action)
+
+    def change_project_favorite(self, favorite):
+        button = self.sender()
+        try:
+            self.library.update_project_favorite(button.property("projectId"), favorite)
+        except Exception as error:
+            button.setChecked(not favorite)
+            QMessageBox.warning(self, "Favorite could not be saved", str(error))
+        self.render_project_favorite_button(button)
+
+    def create_project_card(self, project, paper_count, paper_suffix):
+        card = QWidget(self.project_list.viewport())
+        card.setObjectName("projectCard")
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(9, 8, 6, 8)
+        layout.setSpacing(6)
+        labels = QVBoxLayout()
+        labels.setSpacing(2)
+        title = QLabel(project["name"])
+        title.setObjectName("projectCardTitle")
+        title.setWordWrap(True)
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        labels.addWidget(title)
+        count = QLabel(str(paper_count) + paper_suffix)
+        count.setObjectName("projectCardCount")
+        count.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        labels.addWidget(count)
+        layout.addLayout(labels, 1)
+        layout.addWidget(self.create_project_favorite_button(project))
+        self.style_project_card(card, False)
+        return card
+
+    def style_project_card(self, card, selected):
+        if card.objectName() == "scrapbookCard":
+            self.style_scrapbook_card(card, selected)
+            return
+        color = "#202124"
+        if selected:
+            color = "#443381"
+        card.setStyleSheet(
+            "QWidget#projectCard { background: transparent; border: 0; }"
+            "QLabel#projectCardTitle, QLabel#projectCardCount { background: transparent; "
+            "border: 0; color: " + color + "; }"
+        )
+
+    def create_scrapbook_card(self, paper_count, paper_suffix, project):
+        """Build the visually distinct temporary-paper card."""
+        card = QWidget()
+        card.setObjectName("scrapbookCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(11, 8, 11, 8)
+        layout.setSpacing(3)
+
+        heading_layout = QHBoxLayout()
+        heading_layout.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("ScrapBook")
+        title.setObjectName("scrapbookTitle")
+        title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        heading_layout.addWidget(title)
+        heading_layout.addStretch()
+        badge = QLabel("TEMP")
+        badge.setObjectName("scrapbookBadge")
+        badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        heading_layout.addWidget(badge)
+        heading_layout.addWidget(self.create_project_favorite_button(project))
+        layout.addLayout(heading_layout)
+
+        count_label = QLabel(str(paper_count) + paper_suffix + " · staging area")
+        count_label.setObjectName("scrapbookCount")
+        count_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(count_label)
+        self.style_scrapbook_card(card, False)
+        return card
+
+    def style_scrapbook_card(self, card, selected):
+        """Keep ScrapBook distinct while showing its selection state."""
+        if selected:
+            border_color = "#6350AA"
+            background_color = "#FFF3DC"
+        else:
+            border_color = "#D89A39"
+            background_color = "#FFF9EE"
+        card.setStyleSheet(
+            "QWidget#scrapbookCard { background: "
+            + background_color
+            + "; border: 2px solid "
+            + border_color
+            + "; border-radius: 10px; }"
+            "QLabel#scrapbookTitle { border: 0; background: transparent; "
+            "color: #4B3420; font-size: 15px; font-weight: 700; }"
+            "QLabel#scrapbookBadge { border: 0; border-radius: 7px; "
+            "background: #F2C879; color: #694314; padding: 2px 6px; "
+            "font-size: 10px; font-weight: 700; }"
+            "QLabel#scrapbookCount { border: 0; background: transparent; "
+            "color: #875E2D; font-size: 12px; }"
+        )
+
+    def update_project_card_selection(self, current, previous=None):
+        """Update project card labels and the distinctive ScrapBook border."""
+        if previous is not None:
+            previous_card = self.project_list.itemWidget(previous)
+            if previous_card is not None:
+                self.style_project_card(previous_card, False)
+        if current is not None:
+            current_card = self.project_list.itemWidget(current)
+            if current_card is not None:
+                self.style_project_card(current_card, True)
 
     def refresh_papers(self):
         papers = self.library.list_papers(self.current_project_id)
@@ -1822,6 +3624,8 @@ class MainWindow(QMainWindow):
             papers.sort(key=publication_sort_key)
         elif sort_mode == "author":
             papers.sort(key=author_sort_key)
+        elif sort_mode == "reading_status":
+            papers.sort(key=reading_status_sort_key)
         else:
             papers.sort(key=created_sort_key, reverse=True)
         paper_suffix = ""
@@ -1833,16 +3637,9 @@ class MainWindow(QMainWindow):
         self.paper_list.clear()
         target_row = -1
         for index, paper in enumerate(papers):
-            label = latex_to_plain_text(paper["title"])
-            details = []
-            if paper.get("authors"):
-                details.append(first_author_label(paper["authors"]))
-            if paper.get("year"):
-                details.append(str(paper["year"]))
-            if details:
-                label += "\n" + " · ".join(details)
-            item = QListWidgetItem(label)
+            item = QListWidgetItem(paper_card_label(paper))
             item.setData(Qt.ItemDataRole.UserRole, paper["id"])
+            item.setData(Qt.ItemDataRole.UserRole + 1, paper)
             self.paper_list.addItem(item)
             if paper["id"] == self.current_paper_id:
                 target_row = index
@@ -1860,12 +3657,17 @@ class MainWindow(QMainWindow):
     def select_project(self, item, previous_item=None):
         if not item:
             return
+        self.save_pending_notes()
         self.current_project_id = item.data(Qt.ItemDataRole.UserRole)
         self.current_paper_id = None
-        self.import_button.setEnabled(True)
+        self.add_paper_button.setEnabled(True)
+        self.project_notes_button.setEnabled(True)
+        self.paper_panel.set_drop_enabled(True)
+        self.paper_list.set_drop_enabled(True)
         self.refresh_papers()
 
     def select_paper(self, item, previous_item=None):
+        self.save_pending_notes()
         if not item:
             self.current_paper_id = None
             self.render_empty_detail()
@@ -1878,24 +3680,62 @@ class MainWindow(QMainWindow):
             return
 
         self.current_paper_id = paper_id
+        paper = self.repair_missing_pdf_metadata(paper)
         self.render_paper_detail(paper)
+
+    def repair_missing_pdf_metadata(self, paper):
+        """Repair one legacy local record whose abstract was not extracted."""
+        file_path = paper.get("file_path", "")
+        if paper.get("abstract") or not file_path:
+            return paper
+        attempt_key = (self.workspace_manager.current(), paper["id"])
+        if attempt_key in self.pdf_metadata_attempted:
+            return paper
+        self.pdf_metadata_attempted.add(attempt_key)
+        try:
+            refreshed = self.library.refresh_pdf_metadata(paper["id"])
+        except Exception:
+            return paper
+        if refreshed.get("abstract"):
+            self.statusBar().showMessage(
+                "Recovered abstract from the local PDF",
+                5000,
+            )
+        return refreshed
 
     def render_empty_detail(self):
         self.detail_title.setText("Select a paper")
+        self.render_reading_controls()
+        self.tags_button.setEnabled(False)
+        self.tags_button.setText("+ Add tags")
+        self.paper_tags_label.clear()
+        self.paper_tags_label.setVisible(False)
         self.detail_meta.setText("")
         self.abstract_text.setPlainText("")
         self.task_text.setPlainText("")
         self.methodology_text.setPlainText("")
+        self.notes_save_timer.stop()
+        self.notes_paper_id = None
+        self.notes_dirty = False
+        self.notes_editor.blockSignals(True)
+        self.notes_editor.setPlainText("")
+        self.notes_editor.blockSignals(False)
+        self.notes_editor.setEnabled(False)
+        self.notes_status_label.setText("Select a paper to add notes.")
         self.task_label.setVisible(False)
         self.task_text.setVisible(False)
         self.methodology_label.setVisible(False)
         self.methodology_text.setVisible(False)
         self.assistant_status.setText("")
+        self.copy_paper_button.setText("Copy to project…")
+        self.copy_paper_button.setEnabled(False)
         self.delete_paper_button.setEnabled(False)
         self.update_paper_link_controls(None)
         self.render_pdf_state()
 
     def render_paper_detail(self, paper):
+        self.render_reading_controls(paper)
+        self.render_paper_tags(paper.get("tags", []))
         self.detail_title.setText(
             latex_to_html(paper.get("title", "Untitled paper"))
         )
@@ -1917,6 +3757,7 @@ class MainWindow(QMainWindow):
             metadata.append("Metadata: " + paper["metadata_source"])
         self.detail_meta.setText(latex_to_plain_text(" · ".join(metadata)))
         self.render_abstract_text(paper.get("abstract", ""))
+        self.load_paper_notes(paper)
         self.task_text.setPlainText(
             latex_to_plain_text(paper.get("task", ""))
         )
@@ -1948,6 +3789,18 @@ class MainWindow(QMainWindow):
                 self.assistant_status.setText(
                     "No extracted text or abstract is available yet."
                 )
+        project = self.library.get_project(paper["project_id"])
+        if project and project.get("kind") == "scrapbook":
+            self.copy_paper_button.setText("Move to project…")
+            self.copy_paper_button.setToolTip(
+                "Move this paper and its PDF out of temporary ScrapBook."
+            )
+        else:
+            self.copy_paper_button.setText("Copy to project…")
+            self.copy_paper_button.setToolTip(
+                "Create independent copies in other projects."
+            )
+        self.copy_paper_button.setEnabled(True)
         self.delete_paper_button.setEnabled(True)
 
         self.render_pdf_state(paper)
@@ -1975,10 +3828,56 @@ class MainWindow(QMainWindow):
             return
         self.render_abstract_text(paper.get("abstract", ""))
 
+    def load_paper_notes(self, paper):
+        """Load one paper's manual notes without scheduling a save."""
+        if self.notes_paper_id == paper["id"] and self.notes_dirty:
+            return
+        self.notes_save_timer.stop()
+        self.notes_paper_id = paper["id"]
+        self.notes_dirty = False
+        self.notes_editor.blockSignals(True)
+        self.notes_editor.setPlainText(paper.get("notes", ""))
+        self.notes_editor.blockSignals(False)
+        self.notes_editor.setEnabled(True)
+        self.notes_status_label.setText("Saved automatically")
+
+    def schedule_notes_save(self):
+        """Debounce note writes while the user is typing."""
+        if self.notes_paper_id is None:
+            return
+        self.notes_dirty = True
+        self.notes_status_label.setText("Saving…")
+        self.notes_save_timer.start()
+
+    def save_pending_notes(self):
+        """Persist the current note immediately when needed."""
+        self.notes_save_timer.stop()
+        if self.notes_paper_id is None or not self.notes_dirty:
+            return
+        try:
+            self.library.update_paper_notes(
+                self.notes_paper_id,
+                self.notes_editor.toPlainText(),
+            )
+        except ValueError:
+            self.notes_status_label.setText("Notes could not be saved")
+            return
+        self.notes_dirty = False
+        self.notes_status_label.setText("Saved")
+
     def render_pdf_state(self, paper=None):
+        self.save_pending_reader_state()
+        self.loading_pdf = True
+        self.reader_paper_id = None
+        self.reader_dirty = False
         self.pdf_document.close()
+        self.pdf_toolbar.setVisible(False)
+        self.pdf_comments_panel.setVisible(False)
+        self.pdf_comments_panel.set_context(self.library, None)
+        self.update_pdf_page_controls()
         self.pdf_action_status.setText("")
         if paper is None:
+            self.loading_pdf = False
             self.pdf_stack.setCurrentWidget(self.pdf_empty_panel)
             self.pdf_status_label.setText("Select a paper")
             self.pdf_empty_copy.setText(
@@ -1991,12 +3890,34 @@ class MainWindow(QMainWindow):
             self.pdf_source_button.setVisible(False)
             return
 
+        paper = self.library.get_paper(paper["id"]) or paper
         file_path = paper.get("file_path", "")
         if file_path and os.path.exists(file_path):
             self.pdf_document.load(file_path)
+            self.pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
+            restore_zoom_choice(self.pdf_zoom_combo, paper.get("reader_zoom", "fit_width"))
+            self.change_pdf_zoom()
+            page_count = self.pdf_document.pageCount()
+            if page_count > 0:
+                page = max(min(paper.get("last_page", 0), page_count - 1), 0)
+                self.pdf_view.pageNavigator().jump(page, QPointF())
+                self.reader_paper_id = paper["id"]
+            self.loading_pdf = False
+            self.pdf_toolbar.setVisible(True)
+            self.update_pdf_page_controls()
             self.pdf_stack.setCurrentWidget(self.pdf_view)
+            self.pdf_comments_panel.set_context(
+                self.library,
+                paper["id"],
+            )
+            self.pdf_comments_panel.setVisible(
+                self.pdf_comments_button.isChecked()
+            )
+            if self.detail_tabs.currentWidget() == self.pdf_tab:
+                self.detail_tab_changed(self.detail_tabs.indexOf(self.pdf_tab))
             return
 
+        self.loading_pdf = False
         self.pdf_stack.setCurrentWidget(self.pdf_empty_panel)
         self.pdf_choose_button.setVisible(True)
         self.pdf_choose_button.setEnabled(True)
@@ -2038,6 +3959,131 @@ class MainWindow(QMainWindow):
             self.pdf_primary_button.setVisible(True)
             self.pdf_paste_button.setVisible(True)
             self.pdf_source_button.setVisible(bool(paper.get("external_url")))
+
+    def detail_tab_changed(self, index):
+        """Only count a paper as opened when its local PDF reader is used."""
+        reader_visible = self.page_stack.currentWidget() == self.library_page
+        if index == self.detail_tabs.indexOf(self.pdf_tab) and reader_visible and self.reader_paper_id is not None and not self.loading_pdf:
+            self.reader_dirty = True
+        self.save_pending_reader_state()
+
+    def schedule_reader_save(self, page=None):
+        if self.loading_pdf or self.reader_paper_id is None:
+            return
+        if self.detail_tabs.currentWidget() != self.pdf_tab:
+            return
+        if self.page_stack.currentWidget() != self.library_page:
+            return
+        self.reader_dirty = True
+        self.reader_save_timer.start()
+
+    def save_pending_reader_state(self):
+        """Flush the active PDF's position before switching papers or libraries."""
+        self.reader_save_timer.stop()
+        if self.loading_pdf or self.reader_paper_id is None or not self.reader_dirty:
+            return
+        if self.pdf_document.pageCount() <= 0:
+            return
+        try:
+            self.library.save_reader_state(
+                self.reader_paper_id,
+                self.pdf_view.pageNavigator().currentPage(),
+                self.pdf_zoom_combo.currentData(),
+            )
+        except ValueError:
+            self.reader_dirty = False
+            return
+        except Exception:
+            self.statusBar().showMessage("Reading position could not be saved", 5000)
+            return
+        self.reader_dirty = False
+
+    def update_pdf_page_controls(self, value=None):
+        """Show the visible page and enable valid navigation actions."""
+        page_count = self.pdf_document.pageCount()
+        current_page = self.pdf_view.pageNavigator().currentPage()
+        if page_count <= 0:
+            self.pdf_page_label.setText("Page - of -")
+            self.pdf_previous_button.setEnabled(False)
+            self.pdf_next_button.setEnabled(False)
+            self.pdf_fullscreen_button.setEnabled(False)
+            self.pdf_zoom_combo.setEnabled(False)
+            self.pdf_zoom_out_button.setEnabled(False)
+            self.pdf_zoom_in_button.setEnabled(False)
+            return
+        if current_page < 0:
+            current_page = 0
+        self.pdf_page_label.setText(
+            "Page " + str(current_page + 1) + " of " + str(page_count)
+        )
+        self.pdf_previous_button.setEnabled(current_page > 0)
+        self.pdf_next_button.setEnabled(current_page < page_count - 1)
+        self.pdf_fullscreen_button.setEnabled(True)
+        self.pdf_zoom_combo.setEnabled(True)
+        self.pdf_zoom_out_button.setEnabled(True)
+        self.pdf_zoom_in_button.setEnabled(True)
+
+    def go_to_previous_pdf_page(self):
+        """Move the embedded reader to the preceding page."""
+        navigator = self.pdf_view.pageNavigator()
+        target_page = navigator.currentPage() - 1
+        if target_page >= 0:
+            navigator.jump(target_page, QPointF())
+
+    def go_to_next_pdf_page(self):
+        """Move the embedded reader to the following page."""
+        navigator = self.pdf_view.pageNavigator()
+        target_page = navigator.currentPage() + 1
+        if target_page < self.pdf_document.pageCount():
+            navigator.jump(target_page, QPointF())
+
+    def sync_custom_pdf_zoom(self, zoom):
+        self.pdf_zoom_combo.blockSignals(True)
+        restore_zoom_choice(self.pdf_zoom_combo, zoom)
+        self.pdf_zoom_combo.blockSignals(False)
+        self.schedule_reader_save()
+
+    def change_pdf_zoom(self, index=None):
+        """Apply the selected fit or fixed zoom mode."""
+        zoom = self.pdf_zoom_combo.currentData()
+        if zoom == "fit_width":
+            self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        elif zoom == "fit_page":
+            self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitInView)
+        elif zoom is not None:
+            self.pdf_view.setZoomMode(QPdfView.ZoomMode.Custom)
+            self.pdf_view.setZoomFactor(float(zoom))
+        self.schedule_reader_save()
+
+    def open_fullscreen_pdf(self):
+        """Open the current local PDF in a distraction-free reader."""
+        if self.current_paper_id is None:
+            return
+        paper = self.library.get_paper(self.current_paper_id)
+        if not paper:
+            return
+        file_path = paper.get("file_path", "")
+        if not file_path or not os.path.exists(file_path):
+            return
+        current_page = self.pdf_view.pageNavigator().currentPage()
+        self.save_pending_reader_state()
+        dialog = FullscreenPdfDialog(
+            self,
+            file_path,
+            paper.get("title", "PDF reader"),
+            current_page,
+            self.library,
+            paper["id"],
+            self.pdf_zoom_combo.currentData(),
+        )
+        dialog.showFullScreen()
+        dialog.exec()
+        current_page = dialog.current_page()
+        self.pdf_comments_panel.refresh()
+        restore_zoom_choice(self.pdf_zoom_combo, dialog.zoom_combo.currentData())
+        if current_page >= 0:
+            self.pdf_view.pageNavigator().jump(current_page, QPointF())
+        self.refresh_home()
 
     def update_paper_link_controls(self, paper=None):
         if not hasattr(self, "open_source_button"):
@@ -2210,6 +4256,8 @@ class MainWindow(QMainWindow):
         project = self.library.get_project(self.current_project_id)
         if not project:
             return
+        if project.get("kind") == "scrapbook":
+            return
         name, accepted = QInputDialog.getText(
             self,
             "Rename project",
@@ -2230,7 +4278,14 @@ class MainWindow(QMainWindow):
         if not item:
             return
         self.project_list.setCurrentItem(item)
+        project_id = item.data(Qt.ItemDataRole.UserRole)
+        project = self.library.get_project(project_id)
         menu = QMenu(self)
+        if project and project.get("kind") == "scrapbook":
+            information_action = menu.addAction("Built-in temporary folder")
+            information_action.setEnabled(False)
+            menu.exec(self.project_list.mapToGlobal(position))
+            return
         rename_action = menu.addAction("Rename project")
         delete_action = menu.addAction("Delete project")
         selected_action = menu.exec(self.project_list.mapToGlobal(position))
@@ -2245,6 +4300,8 @@ class MainWindow(QMainWindow):
         project = self.library.get_project(self.current_project_id)
         if not project:
             return
+        if project.get("kind") == "scrapbook":
+            return
         answer = QMessageBox.question(
             self,
             "Delete project",
@@ -2258,20 +4315,94 @@ class MainWindow(QMainWindow):
         self.current_paper_id = None
         self.refresh_projects()
 
-    def choose_pdfs(self):
+    def open_add_paper(self):
+        """Open one project-scoped entry point for local and online papers."""
         if self.current_project_id is None:
+            return
+        project = self.library.get_project(self.current_project_id)
+        if not project:
+            return
+        dialog = AddPaperDialog(
+            self,
+            project,
+            not self.offline_mode,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.choice == "upload":
+            self.choose_pdfs(project["id"])
+        elif dialog.choice == "online":
+            self.discover_papers(project["id"])
+
+    def choose_pdfs(self, project_id=None):
+        """Choose local PDFs, then confirm all destination projects."""
+        if project_id is None:
+            project_id = self.current_project_id
+        if project_id is None:
             return
         paths, accepted = QFileDialog.getOpenFileNames(
             self,
-            "Import PDFs",
+            "Add PDFs",
             "",
             "PDF files (*.pdf)",
         )
         if not accepted or not paths:
             return
-        self.start_import(paths)
+        self.confirm_pdf_destinations(
+            paths,
+            project_id,
+            "Add PDFs to projects",
+            (
+                "Choose every project that should receive an independent "
+                "record and PDF copy."
+            ),
+        )
 
-    def discover_papers(self):
+    def confirm_dropped_pdfs(self, paths):
+        """Confirm a paper-pane drop and optionally add more destinations."""
+        project_id = self.current_project_id
+        project = self.library.get_project(project_id)
+        if not project or not paths:
+            return
+        names = []
+        for path in paths[:3]:
+            names.append(os.path.basename(path))
+        file_summary = ", ".join(names)
+        if len(paths) > 3:
+            file_summary += " and " + str(len(paths) - 3) + " more"
+        prompt = (
+            "Add " + file_summary + "?\n\n" + project["name"]
+            + " is selected because it is open now. Choose any "
+            "additional projects that should receive independent copies."
+        )
+        self.confirm_pdf_destinations(
+            paths,
+            project_id,
+            "Add dropped PDFs",
+            prompt,
+        )
+
+    def confirm_pdf_destinations(self, paths, project_id, title, prompt):
+        """Show the shared multi-project confirmation for local PDFs."""
+        projects = self.library.list_projects()
+        scrapbook_ids = []
+        for project in projects:
+            if project.get("kind") == "scrapbook":
+                scrapbook_ids.append(project["id"])
+        dialog = ProjectSelectionDialog(
+            self,
+            projects,
+            selected_ids=[project_id],
+            exclusive_ids=scrapbook_ids,
+            title=title,
+            prompt=prompt,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        return self.start_import(paths, dialog.selected_project_ids())
+
+    def discover_papers(self, project_id=None):
+        """Search online with one project preselected as the destination."""
         if self.offline_mode:
             QMessageBox.information(
                 self,
@@ -2279,12 +4410,14 @@ class MainWindow(QMainWindow):
                 "Online paper search is unavailable while working offline.",
             )
             return
+        if project_id is None:
+            project_id = self.current_project_id
 
         projects = self.library.list_projects()
         dialog = DiscoveryDialog(
             self,
             projects,
-            self.current_project_id,
+            project_id,
             self.current_paper_id,
             self.search_config,
             self.apply_online_metadata,
@@ -2294,44 +4427,6 @@ class MainWindow(QMainWindow):
             self.discovery_context,
             self.save_discovery_context,
         )
-        dialog.exec()
-
-    def add_from_link(self):
-        if self.offline_mode:
-            return
-        url, accepted = QInputDialog.getText(
-            self,
-            "Add paper from link",
-            "arXiv, DOI, or public project-page URL:",
-        )
-        url = url.strip()
-        parsed_url = QUrl(url)
-        if not accepted or not url:
-            return
-        if not parsed_url.isValid() or parsed_url.scheme() not in ("http", "https"):
-            QMessageBox.warning(
-                self,
-                "Invalid paper link",
-                "Enter a complete public http:// or https:// URL.",
-            )
-            return
-
-        projects = self.library.list_projects()
-        dialog = DiscoveryDialog(
-            self,
-            projects,
-            self.current_project_id,
-            self.current_paper_id,
-            self.search_config,
-            self.apply_online_metadata,
-            self.add_online_paper,
-            self.download_online_paper,
-            self.create_project_from_discovery,
-            self.discovery_context,
-            self.save_discovery_context,
-            initial_query=url,
-        )
-        dialog.setWindowTitle("Add paper from link")
         dialog.exec()
 
     def create_project_from_discovery(self, name):
@@ -2351,6 +4446,9 @@ class MainWindow(QMainWindow):
         return project_search_context(self.library, project_id)
 
     def save_discovery_context(self, project_id, context):
+        project = self.library.get_project(project_id)
+        if project and project.get("kind") == "scrapbook":
+            return
         self.library.update_project_search_context(project_id, context)
 
     def apply_online_metadata(self, result):
@@ -2371,40 +4469,107 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Online metadata applied", 5000)
         return True
 
-    def add_online_paper(self, result, project_id):
-        if project_id is None:
+    def add_online_paper(self, result, project_ids):
+        project_ids = normalize_project_ids(project_ids)
+        if not project_ids:
             return False
+        papers = []
         try:
-            paper = self.library.create_paper_from_search(
-                project_id,
+            project_ids = self.library.validate_destination_projects(
+                project_ids
+            )
+            duplicates = self.library.find_duplicate_papers(
+                project_ids,
                 result,
             )
+            if duplicates and not self.confirm_duplicate_papers(duplicates):
+                return False
+            for project_id in project_ids:
+                papers.append(
+                    self.library.create_paper_from_search(
+                        project_id,
+                        result,
+                    )
+                )
         except ValueError as error:
+            for paper in papers:
+                self.library.delete_paper(paper["id"])
             QMessageBox.warning(self, "Cannot add paper", str(error))
             return False
 
         self.refresh_projects(self.current_project_id)
-        if project_id == self.current_project_id:
+        current_copy = None
+        for paper in papers:
+            if paper["project_id"] == self.current_project_id:
+                current_copy = paper
+                break
+        if current_copy is not None:
             self.refresh_papers()
-            self.select_paper_by_id(paper["id"])
+            self.select_paper_by_id(current_copy["id"])
         self.refresh_home()
-        project = self.library.get_project(project_id)
-        project_name = project["name"]
         self.statusBar().showMessage(
-            "Citation saved to " + project_name,
+            "Citation copied to " + str(len(papers)) + " project(s)",
             5000,
         )
         return True
 
-    def download_online_paper(self, result, project_id):
+    def download_online_paper(self, result, project_ids):
         if self.offline_mode:
             return False
-        if project_id is None:
+        project_ids = normalize_project_ids(project_ids)
+        if not project_ids:
+            return False
+        try:
+            project_ids = self.library.validate_destination_projects(
+                project_ids
+            )
+            duplicates = self.library.find_duplicate_papers(
+                project_ids,
+                result,
+            )
+            if duplicates and not self.confirm_duplicate_papers(duplicates):
+                return False
+        except ValueError as error:
+            QMessageBox.warning(self, "Cannot add paper", str(error))
             return False
         if not result.get("pdf_url"):
             return False
 
-        return self.start_pdf_download(result, project_id)
+        return self.start_pdf_download(result, project_ids)
+
+    def confirm_duplicate_papers(self, duplicates):
+        """Warn about destination duplicates and allow an intentional copy."""
+        lines = []
+        for duplicate in duplicates[:8]:
+            source_file = duplicate.get("source_file", "")
+            prefix = ""
+            if source_file:
+                prefix = source_file + ": "
+            lines.append(
+                "• "
+                + prefix
+                + latex_to_plain_text(duplicate.get("title", "Untitled paper"))
+                + " — already in "
+                + duplicate.get("project_name", "this project")
+                + " ("
+                + duplicate.get("match_reason", "possible match")
+                + ")"
+            )
+        if len(duplicates) > 8:
+            lines.append("• " + str(len(duplicates) - 8) + " more match(es)")
+        message = (
+            "Corpus Cabinet found possible duplicate paper records:\n\n"
+            + "\n".join(lines)
+            + "\n\nAdd another independent copy anyway?"
+        )
+        answer = QMessageBox.question(
+            self,
+            "Possible duplicate paper",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def download_pdf_for_current_paper(self):
         if self.current_paper_id is None or self.offline_mode:
@@ -2431,10 +4596,11 @@ class MainWindow(QMainWindow):
             paper["id"],
         )
 
-    def start_pdf_download(self, result, project_id, paper_id=None):
+    def start_pdf_download(self, result, project_ids, paper_id=None):
         if self.offline_mode:
             return False
-        if project_id is None or not result.get("pdf_url"):
+        project_ids = normalize_project_ids(project_ids)
+        if not project_ids or not result.get("pdf_url"):
             return False
 
         self.online_controls_busy = True
@@ -2442,7 +4608,7 @@ class MainWindow(QMainWindow):
         self.offline_mode_checkbox.setEnabled(False)
         self.project_list.setEnabled(False)
         self.paper_list.setEnabled(False)
-        self.import_button.setEnabled(False)
+        self.add_paper_button.setEnabled(False)
         self.new_project_button.setEnabled(False)
         self.open_library_button.setEnabled(False)
         if paper_id is not None:
@@ -2453,7 +4619,7 @@ class MainWindow(QMainWindow):
 
         task = DownloadTask(
             self.library.path,
-            project_id,
+            project_ids,
             result,
             self.search_config,
             paper_id,
@@ -2471,7 +4637,7 @@ class MainWindow(QMainWindow):
         self.offline_mode_checkbox.setEnabled(False)
         self.project_list.setEnabled(False)
         self.paper_list.setEnabled(False)
-        self.import_button.setEnabled(False)
+        self.add_paper_button.setEnabled(False)
         self.new_project_button.setEnabled(False)
         self.open_library_button.setEnabled(False)
         self.pdf_primary_button.setEnabled(False)
@@ -2490,21 +4656,37 @@ class MainWindow(QMainWindow):
         self.offline_mode_checkbox.setEnabled(True)
         self.project_list.setEnabled(True)
         self.paper_list.setEnabled(True)
-        self.import_button.setEnabled(self.current_project_id is not None)
+        self.add_paper_button.setEnabled(
+            self.current_project_id is not None
+        )
         self.new_project_button.setEnabled(True)
         self.open_library_button.setEnabled(True)
         self.pdf_primary_button.setEnabled(True)
         self.pdf_choose_button.setEnabled(True)
         self.update_search_controls()
 
-    def download_finished(self, paper):
+    def download_finished(self, papers):
         self.restore_download_controls()
-        self.statusBar().showMessage("PDF downloaded and added", 5000)
-        project_id = paper.get("project_id")
+        attached_to_existing = False
+        for paper in papers:
+            if paper.get("id") == self.current_paper_id:
+                attached_to_existing = True
+                break
+        if attached_to_existing:
+            message = "PDF downloaded and attached"
+        else:
+            message = (
+                "PDF downloaded and copied to "
+                + str(len(papers))
+                + " project(s)"
+            )
+        self.statusBar().showMessage(message, 5000)
         self.refresh_projects(self.current_project_id)
-        if project_id == self.current_project_id:
-            self.refresh_papers()
-            self.select_paper_by_id(paper["id"])
+        self.refresh_papers()
+        for paper in papers:
+            if paper.get("project_id") == self.current_project_id:
+                self.select_paper_by_id(paper["id"])
+                break
         self.refresh_home()
 
     def attach_finished(self, paper):
@@ -2521,28 +4703,66 @@ class MainWindow(QMainWindow):
         self.pdf_action_status.setText("")
         QMessageBox.warning(self, "PDF download failed", message)
 
-    def start_import(self, paths):
+    def start_import(
+        self,
+        paths,
+        project_ids=None,
+        allow_duplicates=False,
+    ):
+        if project_ids is None:
+            project_ids = [self.current_project_id]
+        project_ids = normalize_project_ids(project_ids)
+        if not project_ids:
+            return False
         self.online_controls_busy = True
-        self.import_button.setEnabled(False)
+        self.add_paper_button.setEnabled(False)
         self.update_search_controls()
         self.new_project_button.setEnabled(False)
         self.open_library_button.setEnabled(False)
         self.statusBar().showMessage("Importing " + str(len(paths)) + " PDF(s)…")
-        task = ImportTask(self.library.path, self.current_project_id, paths)
+        task = ImportTask(
+            self.library.path,
+            project_ids,
+            paths,
+            allow_duplicates,
+        )
         task.signals.finished.connect(self.import_finished)
         task.signals.failed.connect(self.import_failed)
+        task.signals.duplicatesFound.connect(self.import_duplicates_found)
         self.thread_pool.start(task)
+        return True
 
-    def import_finished(self, papers):
+    def import_duplicates_found(self, payload):
+        """Ask before restarting a local import with duplicates allowed."""
         self.online_controls_busy = False
-        self.import_button.setEnabled(True)
+        self.add_paper_button.setEnabled(True)
         self.update_search_controls()
         self.new_project_button.setEnabled(True)
         self.open_library_button.setEnabled(True)
-        self.statusBar().showMessage("Imported " + str(len(papers)) + " paper(s)", 5000)
+        self.statusBar().clearMessage()
+        if not self.confirm_duplicate_papers(payload["duplicates"]):
+            return
+        self.start_import(
+            payload["paths"],
+            payload["project_ids"],
+            True,
+        )
+
+    def import_finished(self, papers):
+        self.online_controls_busy = False
+        self.add_paper_button.setEnabled(True)
+        self.update_search_controls()
+        self.new_project_button.setEnabled(True)
+        self.open_library_button.setEnabled(True)
+        self.statusBar().showMessage(
+            "Created " + str(len(papers)) + " imported paper copy/copies",
+            5000,
+        )
         selected_id = None
-        if papers:
-            selected_id = papers[-1]["id"]
+        for paper in papers:
+            if paper.get("project_id") == self.current_project_id:
+                selected_id = paper["id"]
+                break
         self.refresh_projects(self.current_project_id)
         self.refresh_papers()
         if selected_id is not None:
@@ -2551,7 +4771,7 @@ class MainWindow(QMainWindow):
 
     def import_failed(self, message):
         self.online_controls_busy = False
-        self.import_button.setEnabled(True)
+        self.add_paper_button.setEnabled(True)
         self.update_search_controls()
         self.new_project_button.setEnabled(True)
         self.open_library_button.setEnabled(True)
@@ -2564,6 +4784,121 @@ class MainWindow(QMainWindow):
             if item.data(Qt.ItemDataRole.UserRole) == paper_id:
                 self.paper_list.setCurrentItem(item)
                 return
+
+    def copy_current_paper(self):
+        if self.current_paper_id is None:
+            return
+        self.save_pending_notes()
+        source_paper_id = self.current_paper_id
+        source_project = self.library.get_project(self.current_project_id)
+        if not source_project:
+            return
+        projects = []
+        for project in self.library.list_projects():
+            if project.get("kind") != "scrapbook":
+                projects.append(project)
+
+        if source_project.get("kind") == "scrapbook":
+            if not projects:
+                QMessageBox.information(
+                    self,
+                    "No destination project",
+                    "Create a project before moving this ScrapBook paper.",
+                )
+                return
+            project_names = []
+            for project in projects:
+                project_names.append(project["name"])
+            selected_name, accepted = QInputDialog.getItem(
+                self,
+                "Move paper from ScrapBook",
+                "Move to:",
+                project_names,
+                0,
+                False,
+            )
+            if not accepted:
+                return
+            target_project = None
+            for project in projects:
+                if project["name"] == selected_name:
+                    target_project = project
+                    break
+            if target_project is None:
+                return
+            try:
+                source_paper = self.library.get_paper(source_paper_id)
+                duplicates = self.library.find_duplicate_papers(
+                    [target_project["id"]],
+                    source_paper,
+                )
+                if duplicates and not self.confirm_duplicate_papers(duplicates):
+                    return
+                moved_paper = self.library.move_scrapbook_paper(
+                    source_paper_id,
+                    target_project["id"],
+                )
+            except (OSError, ValueError) as error:
+                QMessageBox.warning(self, "Cannot move paper", str(error))
+                return
+            self.refresh_projects(target_project["id"])
+            self.select_paper_by_id(moved_paper["id"])
+            self.refresh_home()
+            self.statusBar().showMessage(
+                "Paper moved from ScrapBook to " + target_project["name"],
+                5000,
+            )
+            return
+
+        if len(projects) < 2:
+            QMessageBox.information(
+                self,
+                "No destination project",
+                "Create another project before copying this paper.",
+            )
+            return
+        dialog = ProjectSelectionDialog(
+            self,
+            projects,
+            selected_ids=[self.current_project_id],
+            locked_ids=[self.current_project_id],
+            title="Copy paper to projects",
+            prompt=(
+                "Choose the projects that should receive independent copies. "
+                "The current project is shown as already containing the paper."
+            ),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        project_ids = []
+        for project_id in dialog.selected_project_ids():
+            if project_id != self.current_project_id:
+                project_ids.append(project_id)
+        if not project_ids:
+            return
+        try:
+            source_paper = self.library.get_paper(source_paper_id)
+            duplicates = self.library.find_duplicate_papers(
+                project_ids,
+                source_paper,
+            )
+            if duplicates and not self.confirm_duplicate_papers(duplicates):
+                return
+            copies = self.library.copy_paper_to_projects(
+                source_paper_id,
+                project_ids,
+            )
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Cannot copy paper", str(error))
+            return
+        self.refresh_projects(self.current_project_id)
+        self.refresh_papers()
+        self.select_paper_by_id(source_paper_id)
+        self.refresh_home()
+        self.statusBar().showMessage(
+            "Paper copied to " + str(len(copies)) + " project(s)",
+            5000,
+        )
 
     def delete_current_paper(self):
         if self.current_paper_id is None:
@@ -2579,6 +4914,10 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        self.notes_save_timer.stop()
+        if self.notes_paper_id == self.current_paper_id:
+            self.notes_paper_id = None
+            self.notes_dirty = False
         self.library.delete_paper(self.current_paper_id)
         self.current_paper_id = None
         self.refresh_projects(self.current_project_id)
@@ -2592,10 +4931,19 @@ class MainWindow(QMainWindow):
         )
         if not selected_path:
             return
+        self.save_pending_notes()
+        self.save_pending_reader_state()
         self.workspace_manager.activate(selected_path)
+        self.reader_paper_id = None
         self.current_project_id = None
         self.current_paper_id = None
         self.refresh_library()
+
+    def closeEvent(self, event):
+        """Flush pending notes and reading position before the window closes."""
+        self.save_pending_notes()
+        self.save_pending_reader_state()
+        super().closeEvent(event)
 
 
 def default_paths():
@@ -2641,5 +4989,7 @@ def run_app():
     config_path, default_library = default_paths()
     manager = WorkspaceManager(config_path, default_library)
     window = MainWindow(manager)
+    application.aboutToQuit.connect(window.save_pending_notes)
+    application.aboutToQuit.connect(window.save_pending_reader_state)
     window.show()
     return application.exec()
