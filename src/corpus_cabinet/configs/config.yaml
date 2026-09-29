@@ -1,0 +1,23 @@
+reader:
+  preview_pages: 3
+  max_pages: 80
+  max_file_bytes: 104857600
+  timeout_seconds: 180
+  cpu_threads: 2
+  crop_scale: 2
+  cache_version: 3
+  models_directory: .reader_models
+  html_timeout_seconds: 20
+  max_html_bytes: 8388608
+  max_html_image_bytes: 8388608
+  max_html_images: 200
+  html_cache_version: 2
+
+web_sources:
+  timeout_seconds: 20
+  max_html_bytes: 8388608
+  max_image_bytes: 8388608
+  max_images: 24
+  minimum_text_characters: 120
+  max_index_characters: 100000
+  cache_version: 1

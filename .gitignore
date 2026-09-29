@@ -8,3 +8,5 @@ workspace/
 venv/
 .venv/
 env/
+.reader_models/
+tmp/pdfs/

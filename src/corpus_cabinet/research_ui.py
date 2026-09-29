@@ -1,6 +1,6 @@
 """Show local library search and project research-note dialogs.
 
-Search reads the active library's SQLite paper text and comments without network
+Search reads the active library's SQLite source text and comments without network
 access. Project notes are autosaved to the projects.notes column in that same
 <library>/corpus_cabinet.db database. No PDF files are modified.
 """
@@ -26,7 +26,9 @@ SEARCH_FIELD_LABELS = {
     "authors": "Authors",
     "abstract": "Abstract",
     "notes": "Personal notes",
-    "extracted_text": "PDF text",
+    "extracted_text": "Source text",
+    "canonical_url": "Original URL",
+    "source_metadata": "Source metadata",
     "pdf_comment": "PDF comment",
     "tags": "Tags",
 }
@@ -62,7 +64,7 @@ class LibrarySearchTask(QRunnable):
 
 
 class LibrarySearchDialog(QDialog):
-    """Find papers across projects and return the selected local result."""
+    """Find research sources across projects and return the selected result."""
 
     def __init__(self, parent, library):
         super().__init__(parent)
@@ -78,7 +80,7 @@ class LibrarySearchDialog(QDialog):
         heading.setObjectName("homeSectionHeading")
         layout.addWidget(heading)
         description = QLabel(
-            "Search titles, authors, tags, abstracts, PDF text, notes, and comments "
+            "Search titles, creators, tags, abstracts, article text, READMEs, PDF text, notes, and comments "
             "across all projects. This searches only your library and works offline."
         )
         description.setObjectName("mutedLabel")
@@ -107,7 +109,7 @@ class LibrarySearchDialog(QDialog):
         )
         self.result_list.itemActivated.connect(self.open_result)
         layout.addWidget(self.result_list, 1)
-        self.open_button = QPushButton("Open selected paper")
+        self.open_button = QPushButton("Open selected source")
         self.open_button.clicked.connect(self.open_result)
         self.open_button.setEnabled(False)
         layout.addWidget(self.open_button)
@@ -126,7 +128,7 @@ class LibrarySearchDialog(QDialog):
         self.result_list.clear()
         self.open_button.setEnabled(False)
         if not self.query_input.text().strip():
-            self.status_label.setText("Type to search your saved papers.")
+            self.status_label.setText("Type to search your saved sources.")
             return
         self.status_label.setText("Searching your library…")
         self.search_timer.start()
@@ -151,8 +153,10 @@ class LibrarySearchDialog(QDialog):
             page = paper.get("match_page_number")
             if page:
                 field += " · page " + str(page)
+            source_type = str(paper.get("source_type") or "paper").replace("_", " ").title()
             text = (
-                paper["title"] + "\n" + paper["project_name"] + " · " + field
+                paper["title"] + "\n" + source_type + " · "
+                + paper["project_name"] + " · " + field
                 + "\n" + paper.get("match_excerpt", "")
             )
             item = QListWidgetItem(text)
@@ -166,9 +170,9 @@ class LibrarySearchDialog(QDialog):
         if len(results) >= 100:
             self.status_label.setText("Showing the first 100 matches. Refine your search.")
         elif results:
-            self.status_label.setText(str(len(results)) + " paper(s) found across your library.")
+            self.status_label.setText(str(len(results)) + " source(s) found across your library.")
         else:
-            self.status_label.setText("No saved papers match. Try fewer words.")
+            self.status_label.setText("No saved sources match. Try fewer words.")
 
     def search_failed(self, payload):
         if payload["revision"] != self.revision:
@@ -200,7 +204,7 @@ class ProjectNotesDialog(QDialog):
         heading.setObjectName("homeSectionHeading")
         layout.addWidget(heading)
         description = QLabel(
-            "Connect ideas across papers: shared findings, open questions, "
+            "Connect ideas across sources: shared findings, open questions, "
             "baselines to try, and next steps. These notes belong to the project."
         )
         description.setObjectName("mutedLabel")
@@ -209,7 +213,7 @@ class ProjectNotesDialog(QDialog):
         self.editor = QPlainTextEdit()
         self.editor.setStyleSheet("font-size: 14px; padding: 12px;")
         self.editor.setPlaceholderText(
-            "What have I learned across these papers?\n\n"
+            "What have I learned across these sources?\n\n"
             "Open questions\n\nBaselines and experiments\n\nNext steps"
         )
         self.editor.setPlainText(project.get("notes", ""))

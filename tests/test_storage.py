@@ -5,12 +5,49 @@ pytest's temporary directory and remove those artifacts when each test ends.
 """
 
 import os
+import json
 
 import pymupdf
 import pytest
 
 from corpus_cabinet.assistant import AssistantEngine
 from corpus_cabinet.storage import Library, WorkspaceManager
+
+
+def article_capture():
+    """Return a small provider-neutral web capture for storage tests."""
+    return {
+        "source_type": "article",
+        "title": "A Practical Engineering Article",
+        "authors": "Ada Engineer",
+        "venue": "Engineering Notes",
+        "year": 2026,
+        "abstract": "Implementation details that complement published work.",
+        "canonical_url": "https://example.com/practical-engineering",
+        "external_url": "https://example.com/practical-engineering",
+        "source": "Web article",
+        "extracted_text": "A controller implementation with a useful failure checklist.",
+        "source_metadata": {"published": "2026-09-25"},
+        "source_html": b"<article><p>Controller implementation.</p></article>",
+        "assets": [],
+        "document": {
+            "version": 1,
+            "engine": "Web article",
+            "title": "A Practical Engineering Article",
+            "source_url": "https://example.com/practical-engineering",
+            "partial": False,
+            "warnings": [],
+            "blocks": [
+                {
+                    "id": 1,
+                    "kind": "paragraph",
+                    "role": "body",
+                    "text": "Controller implementation.",
+                    "links": [],
+                }
+            ],
+        },
+    }
 
 
 def create_test_pdf(path):
@@ -48,6 +85,44 @@ def test_library_import_search_and_delete(tmp_path):
     library.delete_paper(paper["id"])
     assert library.get_paper(paper["id"]) is None
     assert not os.path.exists(paper["file_path"])
+
+
+def test_article_sources_migrate_copy_search_and_reopen_offline(tmp_path):
+    library = Library(str(tmp_path / "library"))
+    first_project = library.create_project("Engineering")
+    second_project = library.create_project("Implementation")
+
+    sources = library.create_source_copies(
+        [first_project["id"], second_project["id"]],
+        article_capture(),
+    )
+
+    assert len(sources) == 2
+    assert sources[0]["source_type"] == "article"
+    assert sources[0]["canonical_url"] == article_capture()["canonical_url"]
+    assert sources[0]["content_path"] == sources[1]["content_path"]
+    assert os.path.isfile(sources[0]["content_path"])
+    with open(sources[0]["content_path"], encoding="utf-8") as handle:
+        document = json.load(handle)
+    assert document["engine"] == "Web article"
+    assert library.list_sources(
+        first_project["id"], source_type="article"
+    )[0]["id"] == sources[0]["id"]
+    assert library.list_sources(
+        first_project["id"], source_type="paper"
+    ) == []
+
+    results = library.search_library("failure checklist")
+    assert [result["id"] for result in results] == [sources[0]["id"], sources[1]["id"]]
+    duplicates = library.find_duplicate_papers(
+        [first_project["id"]],
+        article_capture(),
+    )
+    assert duplicates[0]["match_reason"] == "same source URL"
+
+    copied = library.copy_paper(sources[0]["id"], second_project["id"])
+    assert copied["source_type"] == "article"
+    assert copied["content_path"] == sources[0]["content_path"]
 
 
 def test_attach_pdf_to_saved_citation(tmp_path):
@@ -221,6 +296,7 @@ def test_reading_history_status_and_project_notes_persist(tmp_path):
     library.save_reader_state(paper["id"], 2, "1.25")
     library.update_reading_status(paper["id"], "reading")
     library.update_paper_favorite(paper["id"], True)
+    library.update_reader_source(paper["id"], "pdf_preview")
     library.update_project_notes(first_project["id"], "Compare baseline assumptions.")
 
     reopened = Library(root)
@@ -229,6 +305,7 @@ def test_reading_history_status_and_project_notes_persist(tmp_path):
     assert saved["reader_zoom"] == "1.25"
     assert saved["reading_status"] == "reading"
     assert saved["favorite"] == 1
+    assert saved["reader_source"] == "pdf_preview"
     assert reopened.recent_reading_papers()[0]["id"] == paper["id"]
     assert reopened.get_project(first_project["id"])["notes"] == (
         "Compare baseline assumptions."
@@ -237,10 +314,13 @@ def test_reading_history_status_and_project_notes_persist(tmp_path):
     copied = reopened.copy_paper(paper["id"], second_project["id"])
     assert copied["reading_status"] == "reading"
     assert copied["favorite"] == 1
+    assert copied["reader_source"] == "pdf_preview"
     assert copied["last_page"] == 0
     assert copied["last_opened"] == ""
     with pytest.raises(ValueError, match="Choose"):
         reopened.update_reading_status(paper["id"], "finished")
+    with pytest.raises(ValueError, match="Reader source"):
+        reopened.update_reader_source(paper["id"], "unknown")
     with pytest.raises(ValueError, match="zoom"):
         reopened.save_reader_state(paper["id"], 0, "invalid")
     for zoom in ("nan", "inf", "0.1", "4.1"):
@@ -290,27 +370,90 @@ def test_library_search_covers_saved_text_notes_and_pdf_comments(tmp_path):
     assert library.search_library("") == []
 
 
-def test_project_favorites_persist_without_affecting_order_or_papers(tmp_path):
+def test_project_favorites_are_grouped_with_independent_persistent_orders(tmp_path):
     root = str(tmp_path / "library")
     library = Library(root)
     first = library.create_project("First")
     second = library.create_project("Second")
+    third = library.create_project("Third")
     scrapbook = library.get_scrapbook()
     paper = library.create_paper_from_search(first["id"], {"title": "One Paper"})
-    original_order = [project["id"] for project in library.list_projects()]
     assert first["favorite"] == 0
     library.update_project_favorite(second["id"], True)
-    library.update_project_favorite(scrapbook["id"], True)
+    library.update_project_favorite(third["id"], True)
+    assert [project["id"] for project in library.list_projects()] == [
+        scrapbook["id"], second["id"], third["id"], first["id"],
+    ]
+    library.reorder_projects([third["id"], second["id"]], True)
+    assert [project["id"] for project in library.list_projects()] == [
+        scrapbook["id"], third["id"], second["id"], first["id"],
+    ]
+    library.update_project_favorite(third["id"], False)
+    assert [project["id"] for project in library.list_projects()] == [
+        scrapbook["id"], second["id"], first["id"], third["id"],
+    ]
+    library.reorder_projects([third["id"], first["id"]], False)
+    library.update_project_favorite(second["id"], False)
+    assert [project["id"] for project in library.list_projects()] == [
+        scrapbook["id"], third["id"], second["id"], first["id"],
+    ]
+    library.update_project_favorite(second["id"], True)
+    with pytest.raises(ValueError, match="cannot be favorited"):
+        library.update_project_favorite(scrapbook["id"], True)
     reopened = Library(root)
     assert reopened.get_project(second["id"])["favorite"] == 1
-    assert reopened.get_scrapbook()["favorite"] == 1
+    assert reopened.get_scrapbook()["favorite"] == 0
+    assert reopened.get_scrapbook()["color"] == "#4F7FD8"
     assert reopened.get_project(first["id"])["favorite"] == 0
     assert reopened.get_paper(paper["id"])["favorite"] == 0
-    assert [project["id"] for project in reopened.list_projects()] == original_order
+    assert [project["id"] for project in reopened.list_projects()] == [
+        scrapbook["id"], second["id"], third["id"], first["id"],
+    ]
     reopened.update_project_favorite(second["id"], False)
     assert reopened.get_project(second["id"])["favorite"] == 0
+    with pytest.raises(ValueError, match="does not match"):
+        reopened.reorder_projects([first["id"]], False)
     with pytest.raises(ValueError, match="Project not found"):
         reopened.update_project_favorite(-1, True)
+
+
+def test_projects_archive_without_losing_contents_and_restore(tmp_path):
+    root = str(tmp_path / "library")
+    library = Library(root)
+    active = library.create_project("Active")
+    archived = library.create_project("Archive me")
+    paper = library.create_paper_from_search(
+        archived["id"],
+        {"title": "Preserved research source"},
+    )
+    library.update_project_notes(archived["id"], "Keep this synthesis.")
+    library.update_project_favorite(archived["id"], True)
+
+    library.archive_project(archived["id"])
+
+    assert [project["id"] for project in library.list_projects()] == [
+        library.get_scrapbook()["id"], active["id"],
+    ]
+    archived_projects = library.list_archived_projects()
+    assert [project["id"] for project in archived_projects] == [archived["id"]]
+    assert archived_projects[0]["paper_count"] == 1
+    assert library.get_project(archived["id"])["notes"] == "Keep this synthesis."
+    assert library.get_project(archived["id"])["favorite"] == 1
+    assert library.get_paper(paper["id"])["title"] == "Preserved research source"
+    assert library.list_sources(archived["id"]) == []
+    assert library.search_library("Preserved research source") == []
+    with pytest.raises(ValueError, match="Restore the archived project"):
+        library.validate_destination_projects([archived["id"]])
+    with pytest.raises(ValueError, match="cannot be archived"):
+        library.archive_project(library.get_scrapbook()["id"])
+
+    library.restore_project(archived["id"])
+
+    assert library.list_archived_projects() == []
+    assert library.get_project(archived["id"])["archived"] == 0
+    assert library.get_project(archived["id"])["favorite"] == 1
+    assert library.list_sources(archived["id"])[0]["id"] == paper["id"]
+    assert library.search_library("Preserved research source")[0]["id"] == paper["id"]
 
 
 def test_tags_are_normalized_searchable_copied_and_independent(tmp_path):

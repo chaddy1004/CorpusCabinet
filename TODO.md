@@ -44,3 +44,31 @@ text and remain separate from individual paper notes.
 ## New ideas
 
 Add new proposals below, then promote them into priorities when agreed.
+
+- [x] Favorite projects grouped above regular projects, with independent,
+  persistent drag ordering and restoration of regular position when unfavorited.
+- [x] Keep the blue ScrapBook fixed at the top of the sidebar and hide it
+  whenever its staging area is empty, without treating it as a favorite project.
+- [x] Experimental comfortable Reader UI: adjustable single-column typography,
+  source-page actions, expandable visual crops, cached structured documents,
+  cancellable/offline conversion process, persistent generated sources, readable
+  internal-reference previews, and a side-by-side PDF comparison mode.
+- [x] Validate actual Docling conversion on a representative user PDF after
+  installing the optional dependencies and prefetched layout model.
+- [ ] Reader quality checks: omissions, column ordering, captions, inline math,
+  and cases where individual original page regions are a safer fallback.
+- [x] Prefer official arXiv HTML when an identifier or exact-title match exists;
+  cache its source, structured blocks, figures, formulas, and reference targets.
+- [ ] Publisher HTML sources, saved Reader scroll position, section navigation,
+  and reference previews inline instead of in a separate dialog.
+- [x] General research-source foundation: backwards-compatible source types,
+  canonical URLs, cached-content paths, source indicators and project filtering.
+- [x] Reviewed public article capture with readable offline Reader snapshots,
+  original HTML, bounded images, search indexing, and duplicate warnings.
+- [x] Reviewed GitHub repository capture with offline, searchable README Reader
+  snapshots and a link back to the full repository.
+- [x] Local HTML and Markdown import with exact archived originals, relative
+  assets, isolated interactive widgets, searchable Reader copies, and immutable
+  revision history with activation and text comparison.
+- [ ] YouTube metadata, transcripts, timestamped notes, and transcript search.
+- [ ] Full GitHub documentation/code indexing and explicit snapshot refresh.

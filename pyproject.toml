@@ -12,12 +12,19 @@ dependencies = [
     "SQLAlchemy",
     "PyMuPDF",
     "requests",
+    "beautifulsoup4",
+    "PyYAML",
     "anthropic",
     "python-dotenv",
 ]
 
 [project.scripts]
 corpus-cabinet = "corpus_cabinet.desktop:run_app"
+
+[project.optional-dependencies]
+reader = [
+    "docling>=2,<3",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/corpus_cabinet"]

@@ -13,17 +13,20 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pymupdf
 from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QUrl
 from PySide6.QtGui import (
-    QDragEnterEvent, QDropEvent, QFontMetricsF, QKeySequence, QNativeGestureEvent,
-    QPalette, QPointingDevice, QWheelEvent,
+    QDragEnterEvent, QDragMoveEvent, QDropEvent, QFontMetricsF, QKeySequence,
+    QNativeGestureEvent, QPalette, QPointingDevice, QWheelEvent,
 )
 from PySide6.QtNetwork import QNetworkInformation
+from PySide6.QtPdf import QPdfDocument
+from PySide6.QtPrintSupport import QPrinter
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
-    QApplication, QListWidgetItem, QPushButton, QScrollBar, QStyle,
+    QApplication, QDialog, QListWidgetItem, QPushButton, QScrollBar, QStyle,
     QStyleOptionSlider, QStyleOptionViewItem,
 )
 
 from corpus_cabinet.desktop import (
+    ArchivedProjectsDialog,
     BibtexDialog,
     DiscoveryDialog,
     DownloadTask,
@@ -33,13 +36,20 @@ from corpus_cabinet.desktop import (
     ModernComboBox,
     PdfDropListWidget,
     PdfDropPanel,
+    PROJECT_DRAG_MIME,
+    ProjectListWidget,
     ProjectSelectionDialog,
+    SourceCaptureDialog,
+    application_logo_path,
     apply_light_theme,
     comfortable_abstract_html,
     latex_to_html,
     latex_to_plain_text,
+    local_source_paths_from_mime_data,
     pdf_paths_from_mime_data,
+    render_pdf_to_printer,
 )
+from corpus_cabinet.local_documents import capture_local_document
 from corpus_cabinet.storage import Library, WorkspaceManager
 from corpus_cabinet.research_ui import (
     LibrarySearchDialog,
@@ -90,6 +100,41 @@ def create_standalone_abstract_pdf(path):
     document.close()
 
 
+def create_article_capture():
+    return {
+        "source_type": "article",
+        "title": "Readable Engineering Notes",
+        "authors": "Ada Engineer",
+        "venue": "Example Engineering",
+        "year": 2026,
+        "abstract": "A saved implementation guide.",
+        "canonical_url": "https://example.com/engineering-notes",
+        "external_url": "https://example.com/engineering-notes",
+        "source": "Web article",
+        "extracted_text": "A detailed implementation guide with testable advice.",
+        "source_metadata": {"published": "2026-09-25"},
+        "source_html": b"<article>Implementation guide</article>",
+        "assets": [],
+        "document": {
+            "version": 1,
+            "engine": "Web article",
+            "title": "Readable Engineering Notes",
+            "source_url": "https://example.com/engineering-notes",
+            "partial": False,
+            "warnings": [],
+            "blocks": [
+                {
+                    "id": 1,
+                    "kind": "paragraph",
+                    "role": "body",
+                    "text": "A detailed implementation guide with testable advice.",
+                    "links": [],
+                }
+            ],
+        },
+    }
+
+
 def copy_download_fixture(url, destination, config):
     """Stand in for a network download with the configured PDF fixture."""
     shutil.copy2(DOWNLOAD_FIXTURE_PATH, destination)
@@ -125,6 +170,22 @@ def capture_pdf_drop(paths):
     DROP_RESULTS.append(paths)
 
 
+def project_drag_mime(project_id):
+    """Build the app-owned project drag payload used by the sidebar."""
+    mime_data = QMimeData()
+    mime_data.setData(PROJECT_DRAG_MIME, str(project_id).encode("ascii"))
+    return mime_data
+
+
+def project_item_by_id(window, project_id):
+    """Return the sidebar item for one project in its current group order."""
+    for index in range(window.project_list.count()):
+        item = window.project_list.item(index)
+        if item.data(Qt.ItemDataRole.UserRole) == project_id:
+            return item
+    return None
+
+
 def test_lightweight_latex_rendering_is_safe_and_readable():
     assert latex_to_plain_text("LaPA$^2$") == "LaPA²"
     assert latex_to_plain_text(r"Policy $\pi_t$") == "Policy πₜ"
@@ -142,10 +203,25 @@ def test_lightweight_latex_rendering_is_safe_and_readable():
     assert dyslexic_abstract.count("<p>") == 2
 
 
+def test_application_logo_is_bundled_and_loadable():
+    logo_path = application_logo_path()
+
+    assert os.path.basename(logo_path) == "logo.png"
+    assert os.path.isfile(logo_path)
+    with open(logo_path, "rb") as handle:
+        assert handle.read(8) == b"\x89PNG\r\n\x1a\n"
+
+
 def test_pdf_drag_payload_keeps_only_existing_local_pdfs(tmp_path):
     pdf_path = str(tmp_path / "paper.pdf")
+    markdown_path = str(tmp_path / "guide.md")
+    html_path = str(tmp_path / "guide.html")
     text_path = str(tmp_path / "notes.txt")
     create_test_pdf(pdf_path)
+    with open(markdown_path, "w", encoding="utf-8") as handle:
+        handle.write("# Guide\n\nA useful local guide.")
+    with open(html_path, "w", encoding="utf-8") as handle:
+        handle.write("<h1>Guide</h1><p>A useful local guide.</p>")
     with open(text_path, "w", encoding="utf-8") as handle:
         handle.write("not a paper")
 
@@ -153,6 +229,8 @@ def test_pdf_drag_payload_keeps_only_existing_local_pdfs(tmp_path):
     mime_data.setUrls(
         [
             QUrl.fromLocalFile(pdf_path),
+            QUrl.fromLocalFile(markdown_path),
+            QUrl.fromLocalFile(html_path),
             QUrl.fromLocalFile(text_path),
             QUrl.fromLocalFile(str(tmp_path / "promised.pdf")),
             QUrl("https://example.org/paper.pdf"),
@@ -164,12 +242,20 @@ def test_pdf_drag_payload_keeps_only_existing_local_pdfs(tmp_path):
         pdf_path,
         str(tmp_path / "promised.pdf"),
     ]
+    assert local_source_paths_from_mime_data(mime_data) == [
+        pdf_path,
+        markdown_path,
+        html_path,
+    ]
 
 
-def test_paper_list_accepts_pdf_drop_and_shows_active_state(tmp_path):
+def test_paper_list_accepts_pdf_and_markdown_drop_and_shows_active_state(tmp_path):
     DROP_RESULTS.clear()
     pdf_path = str(tmp_path / "paper.pdf")
+    markdown_path = str(tmp_path / "guide.md")
     create_test_pdf(pdf_path)
+    with open(markdown_path, "w", encoding="utf-8") as handle:
+        handle.write("# Guide\n\nA useful local guide.")
     application = QApplication.instance()
     if application is None:
         application = QApplication([])
@@ -184,7 +270,10 @@ def test_paper_list_accepts_pdf_drop_and_shows_active_state(tmp_path):
     application.processEvents()
 
     mime_data = QMimeData()
-    mime_data.setUrls([QUrl.fromLocalFile(pdf_path)])
+    mime_data.setUrls([
+        QUrl.fromLocalFile(pdf_path),
+        QUrl.fromLocalFile(markdown_path),
+    ])
     position = project_list.visualItemRect(item).center()
     drag_event = QDragEnterEvent(
         position,
@@ -193,7 +282,7 @@ def test_paper_list_accepts_pdf_drop_and_shows_active_state(tmp_path):
         Qt.MouseButton.LeftButton,
         Qt.KeyboardModifier.NoModifier,
     )
-    project_list.pdfsDropped.connect(capture_pdf_drop)
+    project_list.sourcesDropped.connect(capture_pdf_drop)
 
     QApplication.sendEvent(project_list.viewport(), drag_event)
     assert drag_event.isAccepted() is True
@@ -207,11 +296,126 @@ def test_paper_list_accepts_pdf_drop_and_shows_active_state(tmp_path):
     )
     QApplication.sendEvent(project_list.viewport(), drop_event)
 
-    assert DROP_RESULTS == [[pdf_path]]
+    assert DROP_RESULTS == [[pdf_path, markdown_path]]
     assert drop_event.isAccepted() is True
     assert drop_event.dropAction() == Qt.DropAction.CopyAction
     assert project_list.property("dragActive") is False
     project_list.close()
+
+
+def test_project_list_drop_emits_order_without_detaching_custom_cards(monkeypatch):
+    application = QApplication.instance()
+    if application is None:
+        application = QApplication([])
+
+    project_list = ProjectListWidget()
+    cards = []
+    for project_id in (1, 2, 3):
+        item = QListWidgetItem("Project " + str(project_id))
+        item.setData(Qt.ItemDataRole.UserRole, project_id)
+        item.setData(Qt.ItemDataRole.UserRole + 2, False)
+        project_list.addItem(item)
+        card = QPushButton("Card " + str(project_id))
+        cards.append(card)
+        project_list.setItemWidget(item, card)
+    project_list.resize(280, 240)
+    project_list.show()
+    application.processEvents()
+
+    drag = Mock()
+    drag_class = Mock(return_value=drag)
+    monkeypatch.setattr("corpus_cabinet.desktop.QDrag", drag_class)
+    project_list.setCurrentRow(0)
+    project_list.startDrag(Qt.DropAction.MoveAction)
+    drag_class.assert_called_once_with(project_list)
+    drag.exec.assert_called_once_with(Qt.DropAction.MoveAction)
+    drag_mime = drag.setMimeData.call_args.args[0]
+    assert bytes(drag_mime.data(PROJECT_DRAG_MIME)) == b"1"
+    assert project_list.count() == 3
+
+    third = project_list.item(2)
+    third_rect = project_list.visualItemRect(third)
+    position = QPointF(third_rect.center().x(), third_rect.bottom() - 1)
+    mime_data = project_drag_mime(1)
+    move_event = QDragMoveEvent(
+        position.toPoint(),
+        Qt.DropAction.MoveAction,
+        mime_data,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    project_list.dragMoveEvent(move_event)
+    assert move_event.isAccepted() is True
+    assert project_list.project_drop_y == third_rect.bottom()
+    drop_event = QDropEvent(
+        position,
+        Qt.DropAction.MoveAction,
+        mime_data,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    order_changed = Mock()
+    project_list.projectOrderChanged.connect(order_changed)
+
+    project_list.dropEvent(drop_event)
+
+    assert [
+        project_list.item(index).data(Qt.ItemDataRole.UserRole)
+        for index in range(project_list.count())
+    ] == [1, 2, 3]
+    assert project_list.itemWidget(project_list.item(0)) is cards[0]
+    assert drop_event.isAccepted() is True
+    assert project_list.project_drop_y is None
+    order_changed.assert_called_once_with([], [2, 3, 1])
+    project_list.close()
+
+
+def test_project_drop_persists_then_rebuilds_every_sidebar_card(tmp_path):
+    root = str(tmp_path / "library")
+    library = Library(root)
+    first = library.create_project("First")
+    second = library.create_project("Second")
+    third = library.create_project("Third")
+    manager = WorkspaceManager(str(tmp_path / "config.json"), root)
+    application = QApplication.instance()
+    if application is None:
+        application = QApplication([])
+    window = MainWindow(manager)
+    window.show()
+    application.processEvents()
+
+    first_item = project_item_by_id(window, first["id"])
+    third_item = project_item_by_id(window, third["id"])
+    window.project_list.setCurrentItem(first_item)
+    third_rect = window.project_list.visualItemRect(third_item)
+    position = QPointF(third_rect.center().x(), third_rect.bottom() - 1)
+    mime_data = project_drag_mime(first["id"])
+    drop_event = QDropEvent(
+        position,
+        Qt.DropAction.MoveAction,
+        mime_data,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+
+    window.project_list.dropEvent(drop_event)
+    application.processEvents()
+
+    expected_ids = [second["id"], third["id"], first["id"]]
+    assert [
+        window.project_list.item(index).data(Qt.ItemDataRole.UserRole)
+        for index in range(window.project_list.count())
+    ] == expected_ids
+    assert [
+        project["id"]
+        for project in library.list_projects()
+        if project.get("kind") != "scrapbook"
+    ] == expected_ids
+    assert all(
+        window.project_list.itemWidget(window.project_list.item(index)) is not None
+        for index in range(window.project_list.count())
+    )
+    window.close()
 
 
 def test_surrounding_paper_panel_accepts_pdf_drop(tmp_path):
@@ -227,7 +431,7 @@ def test_surrounding_paper_panel_accepts_pdf_drop(tmp_path):
     panel.resize(320, 240)
     panel.show()
     application.processEvents()
-    panel.pdfsDropped.connect(capture_pdf_drop)
+    panel.sourcesDropped.connect(capture_pdf_drop)
     mime_data = QMimeData()
     mime_data.setUrls([QUrl.fromLocalFile(pdf_path)])
     position = panel.rect().center()
@@ -255,6 +459,49 @@ def test_surrounding_paper_panel_accepts_pdf_drop(tmp_path):
     panel.close()
 
 
+def test_dropped_markdown_uses_current_project_and_archives_document(
+    tmp_path,
+    monkeypatch,
+):
+    root = str(tmp_path / "library")
+    markdown_path = tmp_path / "controls-guide.md"
+    markdown_path.write_text(
+        "# Controls guide\n\n"
+        "This engineering guide documents a repeatable calibration workflow "
+        "with enough context to remain useful during offline implementation "
+        "and review. The archived copy should preserve this exact source.\n",
+        encoding="utf-8",
+    )
+    library = Library(root)
+    project = library.create_project("Documentation")
+    manager = WorkspaceManager(str(tmp_path / "config.json"), root)
+    application = QApplication.instance()
+    if application is None:
+        application = QApplication([])
+    window = MainWindow(manager)
+    monkeypatch.setattr(
+        ProjectSelectionDialog,
+        "exec",
+        Mock(return_value=QDialog.DialogCode.Accepted),
+    )
+    monkeypatch.setattr(
+        ProjectSelectionDialog,
+        "selected_project_ids",
+        Mock(return_value=[project["id"]]),
+    )
+
+    window.confirm_dropped_sources([str(markdown_path)])
+    application.processEvents()
+
+    sources = library.list_sources(project["id"])
+    assert len(sources) == 1
+    assert sources[0]["source_type"] == "document"
+    assert sources[0]["title"] == "Controls guide"
+    assert os.path.isfile(sources[0]["content_path"])
+    assert window.current_paper_id == sources[0]["id"]
+    window.close()
+
+
 def test_main_window_displays_imported_paper(tmp_path):
     root = str(tmp_path / "library")
     source_path = str(tmp_path / "paper.pdf")
@@ -273,22 +520,16 @@ def test_main_window_displays_imported_paper(tmp_path):
     window.network_reachability_changed(
         QNetworkInformation.Reachability.Online
     )
-    scrapbook_item = window.project_list.item(0)
-    scrapbook_card = window.project_list.itemWidget(scrapbook_item)
-    assert "ScrapBook" in scrapbook_item.text()
-    assert scrapbook_item.sizeHint().height() == 82
-    assert scrapbook_card.objectName() == "scrapbookCard"
-    assert "border: 2px solid #6350AA" in scrapbook_card.styleSheet()
+    assert project_item_by_id(window, library.get_scrapbook()["id"]) is None
     for index in range(window.project_list.count()):
         project_item = window.project_list.item(index)
         if project_item.data(Qt.ItemDataRole.UserRole) == project["id"]:
             window.project_list.setCurrentItem(project_item)
             break
-    assert "border: 2px solid #D89A39" in scrapbook_card.styleSheet()
     window.paper_list.setCurrentRow(0)
     application.processEvents()
 
-    assert window.project_list.count() == 2
+    assert window.project_list.count() == 1
     assert window.paper_list.count() == 1
     assert window.detail_title.text() == "Desktop MVP Paper"
     assert bool(
@@ -310,7 +551,7 @@ def test_main_window_displays_imported_paper(tmp_path):
     assert window.offline_mode_checkbox.isChecked() is False
     assert hasattr(window, "discover_button") is False
     assert window.add_paper_button.isEnabled() is True
-    assert window.add_paper_button.text() == "+ Add paper"
+    assert window.add_paper_button.text() == "+ Add source"
     assert window.page_stack.currentWidget() == window.home_page
     assert window.open_library_button.text() == "Library folder…"
     assert "Current library:" in window.open_library_button.toolTip()
@@ -373,7 +614,13 @@ def test_main_window_displays_imported_paper(tmp_path):
     application.processEvents()
     assert window.dyslexic_font_enabled is True
     assert "OpenDyslexic" in window.abstract_text.toHtml()
+    assert window.reader_panel.dyslexic_toggle.isChecked()
     assert manager.is_dyslexic_font_enabled() is True
+
+    window.reader_panel.dyslexic_toggle.setChecked(False)
+    application.processEvents()
+    assert not window.abstract_font_toggle.isChecked()
+    assert manager.is_dyslexic_font_enabled() is False
 
     second_project = library.create_project("Second destination")
     dialog = DiscoveryDialog(
@@ -460,6 +707,223 @@ def test_main_window_displays_imported_paper(tmp_path):
     window.close()
 
 
+def test_saved_article_uses_reader_hides_paper_actions_and_filters_by_type(tmp_path):
+    root = str(tmp_path / "library")
+    library = Library(root)
+    project = library.create_project("Engineering Sources")
+    source = library.create_source_copies(
+        [project["id"]],
+        create_article_capture(),
+    )[0]
+    manager = WorkspaceManager(str(tmp_path / "config.json"), root)
+
+    application = QApplication.instance()
+    if application is None:
+        application = QApplication([])
+    window = MainWindow(manager)
+    for index in range(window.project_list.count()):
+        item = window.project_list.item(index)
+        if item.data(Qt.ItemDataRole.UserRole) == project["id"]:
+            window.project_list.setCurrentItem(item)
+            break
+    window.paper_list.setCurrentRow(0)
+    application.processEvents()
+
+    assert window.detail_title.text() == "Readable Engineering Notes"
+    assert "Article" in window.detail_meta.text()
+    assert window.abstract_label.text() == "Summary"
+    assert window.detail_tabs.isTabVisible(
+        window.detail_tabs.indexOf(window.pdf_tab)
+    ) is False
+    assert window.open_source_button.text() == "Open original article"
+    assert window.scholar_button.isVisible() is False
+    assert window.bibtex_button.isVisible() is False
+    assert window.reader_panel.document_data["engine"] == "Web article"
+    assert "testable advice" in window.reader_panel.browser.toPlainText()
+    assert window.paper_list.item(0).data(
+        Qt.ItemDataRole.UserRole + 1
+    )["source_type"] == "article"
+
+    window.source_type_combo.setCurrentIndex(
+        window.source_type_combo.findData("paper")
+    )
+    application.processEvents()
+    assert window.paper_list.count() == 0
+    window.source_type_combo.setCurrentIndex(
+        window.source_type_combo.findData("web")
+    )
+    application.processEvents()
+    assert window.paper_list.count() == 1
+    assert library.get_source(source["id"])["content_path"]
+    window.close()
+
+
+def test_saved_markdown_document_shows_reader_original_and_versions(tmp_path):
+    root = str(tmp_path / "library")
+    source_path = tmp_path / "guide.md"
+    source_path.write_text(
+        "# Robot setup guide\n\n"
+        "This archived procedure explains the calibration workflow in enough "
+        "detail to remain useful during offline engineering review.\n",
+        encoding="utf-8",
+    )
+    library = Library(root)
+    project = library.create_project("Documentation")
+    capture = capture_local_document(str(source_path))
+    source = library.create_source_from_capture(project["id"], capture)
+    manager = WorkspaceManager(str(tmp_path / "config.json"), root)
+
+    application = QApplication.instance()
+    if application is None:
+        application = QApplication([])
+    window = MainWindow(manager)
+    for index in range(window.project_list.count()):
+        item = window.project_list.item(index)
+        if item.data(Qt.ItemDataRole.UserRole) == project["id"]:
+            window.project_list.setCurrentItem(item)
+            break
+    window.select_paper_by_id(source["id"])
+    application.processEvents()
+
+    assert window.detail_title.text() == "Robot setup guide"
+    assert window.source_type_combo.findData("markdown") >= 0
+    assert window.detail_tabs.isTabVisible(
+        window.detail_tabs.indexOf(window.pdf_tab)
+    ) is False
+    assert window.detail_tabs.isTabVisible(
+        window.detail_tabs.indexOf(window.interactive_document_panel)
+    ) is True
+    assert window.detail_tabs.isTabVisible(
+        window.detail_tabs.indexOf(window.document_versions_panel)
+    ) is True
+    assert "calibration workflow" in window.reader_panel.browser.toPlainText()
+    assert "# Robot setup guide" in (
+        window.interactive_document_panel.raw_text.toPlainText()
+    )
+    assert window.document_versions_panel.version_list.count() == 1
+    window.close()
+
+
+def test_source_list_groups_content_types_and_collapses_sections(tmp_path):
+    root = str(tmp_path / "library")
+    markdown_path = tmp_path / "guide.md"
+    html_path = tmp_path / "report.html"
+    markdown_path.write_text(
+        "# Controls guide\n\n"
+        "A repeatable calibration procedure for the complete robot system. "
+        "It records setup, safety checks, expected results, and recovery "
+        "steps so the document remains useful during offline review.",
+        encoding="utf-8",
+    )
+    html_path.write_text(
+        "<html><head><title>Audit report</title></head>"
+        "<body><p>A saved engineering audit covering system setup, safety "
+        "checks, expected results, and recovery steps for future offline "
+        "implementation and review.</p></body></html>",
+        encoding="utf-8",
+    )
+    library = Library(root)
+    project = library.create_project("Mixed sources")
+    paper = library.create_paper_from_search(
+        project["id"],
+        {"title": "Research paper"},
+    )
+    markdown = library.create_source_from_capture(
+        project["id"],
+        capture_local_document(str(markdown_path)),
+    )
+    html_source = library.create_source_from_capture(
+        project["id"],
+        capture_local_document(str(html_path)),
+    )
+    web = library.create_source_copies(
+        [project["id"]],
+        create_article_capture(),
+    )[0]
+    manager = WorkspaceManager(str(tmp_path / "config.json"), root)
+    application = QApplication.instance()
+    if application is None:
+        application = QApplication([])
+
+    window = MainWindow(manager)
+    application.processEvents()
+
+    headers = {}
+    header_rows = []
+    visible_source_ids = []
+    for row in range(window.paper_list.count()):
+        item = window.paper_list.item(row)
+        if item.data(Qt.ItemDataRole.UserRole + 3) == "source_group_header":
+            button = window.paper_list.itemWidget(item)
+            headers[button.property("groupKey")] = button
+            header_rows.append(row)
+        elif item.data(Qt.ItemDataRole.UserRole) is not None:
+            visible_source_ids.append(item.data(Qt.ItemDataRole.UserRole))
+    assert set(headers) == {"paper", "markdown", "html", "web"}
+    assert set(visible_source_ids) == {
+        paper["id"], markdown["id"], html_source["id"], web["id"]
+    }
+    assert window.paper_list.count() == 8
+    delegate = window.paper_list.itemDelegate()
+    for row in header_rows:
+        index = window.paper_list.model().index(row, 0)
+        option = QStyleOptionViewItem()
+        assert delegate.sizeHint(option, index).height() == 36
+        painter = Mock()
+        delegate.paint(painter, option, index)
+        painter.save.assert_not_called()
+
+    headers["html"].click()
+    application.processEvents()
+
+    visible_source_ids = [
+        window.paper_list.item(row).data(Qt.ItemDataRole.UserRole)
+        for row in range(window.paper_list.count())
+        if window.paper_list.item(row).data(Qt.ItemDataRole.UserRole)
+        is not None
+    ]
+    assert html_source["id"] not in visible_source_ids
+    assert window.paper_list.count() == 7
+    html_header = None
+    for row in range(window.paper_list.count()):
+        item = window.paper_list.item(row)
+        button = window.paper_list.itemWidget(item)
+        if button is not None and button.property("groupKey") == "html":
+            html_header = button
+            break
+    assert html_header is not None
+    assert html_header.accessibleName() == "Expand HTML documents"
+
+    window.source_type_combo.setCurrentIndex(
+        window.source_type_combo.findData("html")
+    )
+    application.processEvents()
+    assert window.paper_list.count() == 1
+    assert window.paper_list.item(0).data(
+        Qt.ItemDataRole.UserRole
+    ) == html_source["id"]
+    window.close()
+
+
+def test_source_capture_dialog_starts_unsaved_and_has_project_confirmation(tmp_path):
+    library = Library(str(tmp_path / "library"))
+    project = library.create_project("Web")
+    application = QApplication.instance()
+    if application is None:
+        application = QApplication([])
+    dialog = SourceCaptureDialog(
+        None,
+        library.list_projects(),
+        project["id"],
+        lambda capture, project_ids: True,
+    )
+
+    assert dialog.windowTitle() == "Save website or repository"
+    assert dialog.save_button.isEnabled() is False
+    assert "github.com" in dialog.url_input.placeholderText()
+    dialog.close()
+
+
 def test_saved_citation_shows_contextual_pdf_actions(tmp_path):
     root = str(tmp_path / "library")
     library = Library(root)
@@ -540,6 +1004,7 @@ def test_pdf_viewer_navigates_every_loaded_page(tmp_path):
     assert window.pdf_previous_button.isEnabled() is False
     assert window.pdf_next_button.isEnabled() is True
     assert window.pdf_fullscreen_button.isEnabled() is True
+    assert window.pdf_print_button.isEnabled() is True
 
     window.pdf_next_button.click()
     application.processEvents()
@@ -569,6 +1034,7 @@ def test_pdf_viewer_navigates_every_loaded_page(tmp_path):
     assert reader.page_label.text() == "Page 2 of 3"
     assert reader.escape_shortcut.key() == QKeySequence("Escape")
     assert reader.comments_button.isVisible() is True
+    assert reader.print_button.isEnabled() is True
     reader.comments_panel.editor.setPlainText("Inspect the second page.")
     reader.comments_panel.add_button.click()
     assert library.list_paper_comments(paper["id"])[0]["page_number"] == 2
@@ -579,6 +1045,30 @@ def test_pdf_viewer_navigates_every_loaded_page(tmp_path):
     assert library.get_paper(paper["id"])["last_page"] == 2
     reader.close()
     window.close()
+
+
+def test_pdf_print_renderer_outputs_selected_page_range(tmp_path):
+    application = QApplication.instance()
+    if application is None:
+        application = QApplication([])
+    source_path = str(tmp_path / "print-source.pdf")
+    output_path = str(tmp_path / "printed-pages.pdf")
+    create_multi_page_test_pdf(source_path)
+    document = QPdfDocument()
+    document.load(source_path)
+    printer = QPrinter(QPrinter.PrinterMode.ScreenResolution)
+    printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+    printer.setOutputFileName(output_path)
+    printer.setFromTo(2, 3)
+
+    assert render_pdf_to_printer(document, printer) is True
+
+    printed = pymupdf.open(output_path)
+    assert printed.page_count == 2
+    preview = printed[0].get_pixmap()
+    assert min(preview.samples) < 200
+    printed.close()
+    document.close()
 
 
 def test_home_resumes_page_zoom_status_and_favorite_after_restart(tmp_path):
@@ -851,12 +1341,62 @@ def test_selecting_papers_keeps_pane_widths_and_window_size_stable(tmp_path):
     window.close()
 
 
+def test_project_archive_hides_sidebar_and_restore_dialog_returns_it(tmp_path):
+    root = str(tmp_path / "library")
+    library = Library(root)
+    first = library.create_project("Current work")
+    archived = library.create_project("Older experiment")
+    library.create_paper_from_search(
+        archived["id"],
+        {"title": "Archived source"},
+    )
+    manager = WorkspaceManager(str(tmp_path / "config.json"), root)
+    application = QApplication.instance()
+    if application is None:
+        application = QApplication([])
+    window = MainWindow(manager)
+    window.show_library()
+    window.show()
+    application.processEvents()
+    archived_item = project_item_by_id(window, archived["id"])
+    window.project_list.setCurrentItem(archived_item)
+    assert window.current_project_id == archived["id"]
+
+    window.archive_current_project()
+    application.processEvents()
+
+    assert project_item_by_id(window, archived["id"]) is None
+    assert project_item_by_id(window, first["id"]) is not None
+    assert window.archived_projects_button.isVisible() is True
+    assert window.archived_projects_button.text() == "Archived projects (1)…"
+    assert library.get_project(archived["id"])["archived"] == 1
+    dialog = ArchivedProjectsDialog(window, library)
+    assert dialog.project_list.count() == 1
+    assert "Older experiment" in dialog.project_list.item(0).text()
+    assert "1 source" in dialog.project_list.item(0).text()
+    assert dialog.restore_button.isEnabled() is True
+    dialog.restore_button.click()
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    assert dialog.restored_project_id == archived["id"]
+
+    window.refresh_projects(selected_id=dialog.restored_project_id)
+    application.processEvents()
+    assert project_item_by_id(window, archived["id"]) is not None
+    assert window.current_project_id == archived["id"]
+    assert window.archived_projects_button.isVisible() is False
+    window.close()
+
+
 def test_project_favorite_stars_preserve_selection_and_survive_restart(tmp_path, monkeypatch):
     root = str(tmp_path / "library")
     library = Library(root)
     first = library.create_project("First")
     second = library.create_project("Second")
     paper = library.create_paper_from_search(first["id"], {"title": "One Paper"})
+    library.create_paper_from_search(
+        library.get_scrapbook()["id"],
+        {"title": "Staged source"},
+    )
     application = QApplication.instance()
     if application is None:
         application = QApplication([])
@@ -865,27 +1405,39 @@ def test_project_favorite_stars_preserve_selection_and_survive_restart(tmp_path,
     window.navigate_to_paper(paper["id"])
     window.show()
     application.processEvents()
-    second_card = window.project_list.itemWidget(window.project_list.item(2))
+    second_item = project_item_by_id(window, second["id"])
+    second_card = window.project_list.itemWidget(second_item)
     star = second_card.findChild(QPushButton, "projectFavoriteButton")
     assert star.text() == "☆"
     QTest.mouseClick(star, Qt.MouseButton.LeftButton)
     assert library.get_project(second["id"])["favorite"] == 1
+    second_item = project_item_by_id(window, second["id"])
+    assert window.project_list.row(second_item) == 1
+    second_card = window.project_list.itemWidget(second_item)
+    star = second_card.findChild(QPushButton, "projectFavoriteButton")
     assert star.text() == "★"
     assert "#D9A000" in star.styleSheet()
     assert window.current_project_id == first["id"]
     assert window.current_paper_id == paper["id"]
     QTest.mouseClick(second_card, Qt.MouseButton.LeftButton, pos=QPoint(12, 12))
     assert window.current_project_id == second["id"]
-    scrapbook_card = window.project_list.itemWidget(window.project_list.item(0))
-    scrapbook_star = scrapbook_card.findChild(QPushButton, "projectFavoriteButton")
-    scrapbook_star.click()
-    assert library.get_scrapbook()["favorite"] == 1
+    scrapbook_item = project_item_by_id(window, library.get_scrapbook()["id"])
+    scrapbook_card = window.project_list.itemWidget(scrapbook_item)
+    assert "border: 2px solid #6B93E8" in scrapbook_card.styleSheet()
+    assert scrapbook_card.findChild(
+        QPushButton, "projectFavoriteButton"
+    ) is None
+    assert library.get_scrapbook()["favorite"] == 0
     assert window.current_project_id == second["id"]
+    scrapbook_item = project_item_by_id(window, library.get_scrapbook()["id"])
+    assert window.project_list.row(scrapbook_item) == 0
+    scrapbook_card = window.project_list.itemWidget(scrapbook_item)
     QTest.mouseClick(scrapbook_card, Qt.MouseButton.LeftButton, pos=QPoint(12, 12))
     assert window.current_project_id == library.get_scrapbook()["id"]
     window.close()
     reopened = MainWindow(manager)
-    reopened_star = reopened.project_list.itemWidget(reopened.project_list.item(2)).findChild(
+    reopened_item = project_item_by_id(reopened, second["id"])
+    reopened_star = reopened.project_list.itemWidget(reopened_item).findChild(
         QPushButton, "projectFavoriteButton"
     )
     assert reopened_star.isChecked()
@@ -893,6 +1445,10 @@ def test_project_favorite_stars_preserve_selection_and_survive_restart(tmp_path,
     assert "Remove project" in reopened_star.accessibleName()
     reopened_star.click()
     assert library.get_project(second["id"])["favorite"] == 0
+    reopened_item = project_item_by_id(reopened, second["id"])
+    reopened_star = reopened.project_list.itemWidget(reopened_item).findChild(
+        QPushButton, "projectFavoriteButton"
+    )
     assert reopened_star.text() == "☆"
     monkeypatch.setattr(reopened.library, "update_project_favorite", Mock(side_effect=ValueError("Save failed")))
     monkeypatch.setattr("corpus_cabinet.desktop.QMessageBox.warning", Mock())

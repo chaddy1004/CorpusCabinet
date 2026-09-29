@@ -14,6 +14,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from corpus_cabinet.pdfs import extract_pdf_metadata, extract_pdf_text
+from corpus_cabinet.web_sources import capture_digest, safe_asset_name
 
 
 def normalize_paper_identifier(value):
@@ -54,6 +55,19 @@ def calculate_file_sha256(path):
                 break
             digest.update(block)
     return digest.hexdigest()
+
+
+def stored_capture_paths(content_path, capture):
+    """Return archived original and interactive paths for one capture."""
+    cache_path = os.path.dirname(content_path)
+    extension = str(capture.get("source_extension") or ".html").casefold()
+    if extension not in (".html", ".htm", ".md", ".markdown"):
+        extension = ".html"
+    original_path = os.path.join(cache_path, "source" + extension)
+    interactive_path = ""
+    if capture.get("interactive_html"):
+        interactive_path = os.path.join(cache_path, "interactive.html")
+    return original_path, interactive_path
 
 
 def library_match_excerpt(text, terms):
@@ -231,6 +245,9 @@ class Library:
                 search_context TEXT DEFAULT '',
                 folder_path TEXT NOT NULL,
                 position INTEGER,
+                favorite INTEGER DEFAULT 0,
+                favorite_position INTEGER,
+                archived INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS papers (
@@ -258,6 +275,12 @@ class Library:
                 extracted_text TEXT DEFAULT '',
                 file_path TEXT NOT NULL,
                 scholar_id TEXT DEFAULT '',
+                reader_source TEXT DEFAULT '',
+                source_type TEXT DEFAULT 'paper',
+                canonical_url TEXT DEFAULT '',
+                source_metadata TEXT DEFAULT '{}',
+                content_path TEXT DEFAULT '',
+                current_version_id INTEGER,
                 position INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
@@ -279,6 +302,24 @@ class Library:
                 body TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS source_versions (
+                id INTEGER PRIMARY KEY,
+                paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                version_number INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                abstract TEXT DEFAULT '',
+                source_format TEXT NOT NULL,
+                original_filename TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                original_path TEXT NOT NULL,
+                interactive_path TEXT DEFAULT '',
+                document_path TEXT NOT NULL,
+                extracted_text TEXT DEFAULT '',
+                source_metadata TEXT DEFAULT '{}',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (paper_id, version_number),
+                UNIQUE (paper_id, content_hash)
+            );
             """
         )
         self.ensure_column(connection, "projects", "position", "INTEGER")
@@ -286,6 +327,8 @@ class Library:
         self.ensure_column(connection, "projects", "search_context", "TEXT DEFAULT ''")
         self.ensure_column(connection, "projects", "notes", "TEXT DEFAULT ''")
         self.ensure_column(connection, "projects", "favorite", "INTEGER DEFAULT 0")
+        self.ensure_column(connection, "projects", "favorite_position", "INTEGER")
+        self.ensure_column(connection, "projects", "archived", "INTEGER DEFAULT 0")
         self.ensure_column(connection, "papers", "extracted_text", "TEXT DEFAULT ''")
         self.ensure_column(connection, "papers", "position", "INTEGER")
         self.ensure_column(connection, "papers", "notes", "TEXT DEFAULT ''")
@@ -302,6 +345,20 @@ class Library:
         self.ensure_column(connection, "papers", "last_opened", "TEXT DEFAULT ''")
         self.ensure_column(connection, "papers", "reading_status", "TEXT DEFAULT 'unread'")
         self.ensure_column(connection, "papers", "favorite", "INTEGER DEFAULT 0")
+        self.ensure_column(connection, "papers", "reader_source", "TEXT DEFAULT ''")
+        self.ensure_column(connection, "papers", "source_type", "TEXT DEFAULT 'paper'")
+        self.ensure_column(connection, "papers", "canonical_url", "TEXT DEFAULT ''")
+        self.ensure_column(connection, "papers", "source_metadata", "TEXT DEFAULT '{}'")
+        self.ensure_column(connection, "papers", "content_path", "TEXT DEFAULT ''")
+        self.ensure_column(connection, "papers", "current_version_id", "INTEGER")
+        connection.execute(
+            "UPDATE papers SET source_type = 'paper' "
+            "WHERE source_type IS NULL OR source_type = ''"
+        )
+        connection.execute(
+            "UPDATE projects SET favorite_position = position "
+            "WHERE favorite = 1 AND favorite_position IS NULL"
+        )
         self.ensure_scrapbook(connection)
         connection.commit()
         connection.close()
@@ -321,7 +378,9 @@ class Library:
         ).fetchone()
         if scrapbook:
             connection.execute(
-                "UPDATE projects SET name = 'ScrapBook', position = -1 "
+                "UPDATE projects SET name = 'ScrapBook', color = '#4F7FD8', "
+                "position = -1, favorite = 0, favorite_position = NULL, "
+                "archived = 0 "
                 "WHERE id = ?",
                 (scrapbook["id"],),
             )
@@ -333,7 +392,8 @@ class Library:
         if named_project:
             connection.execute(
                 "UPDATE projects SET name = 'ScrapBook', kind = 'scrapbook', "
-                "position = -1 WHERE id = ?",
+                "color = '#4F7FD8', position = -1, favorite = 0, "
+                "favorite_position = NULL, archived = 0 WHERE id = ?",
                 (named_project["id"],),
             )
             return
@@ -352,25 +412,38 @@ class Library:
             """
             INSERT INTO projects (
                 name, color, kind, folder_path, position, created_at
-            ) VALUES ('ScrapBook', '#D98B3A', 'scrapbook', ?, -1, ?)
+            ) VALUES ('ScrapBook', '#4F7FD8', 'scrapbook', ?, -1, ?)
             """,
             (folder_path, created_at),
         )
 
-    def list_projects(self):
+    def list_projects(self, archived=False):
         connection = self.connect()
         rows = connection.execute(
             """
             SELECT projects.*, COUNT(papers.id) AS paper_count
             FROM projects
             LEFT JOIN papers ON papers.project_id = projects.id
+            WHERE projects.archived = ?
             GROUP BY projects.id
             ORDER BY CASE WHEN projects.kind = 'scrapbook' THEN 0 ELSE 1 END,
-                     projects.position IS NULL, projects.position, projects.created_at
-            """
+                     projects.favorite DESC,
+                     CASE WHEN projects.favorite = 1
+                          THEN projects.favorite_position
+                          ELSE projects.position END IS NULL,
+                     CASE WHEN projects.favorite = 1
+                          THEN projects.favorite_position
+                          ELSE projects.position END,
+                     projects.created_at
+            """,
+            (int(bool(archived)),),
         ).fetchall()
         connection.close()
         return [dict(row) for row in rows]
+
+    def list_archived_projects(self):
+        """Return projects hidden from the active sidebar."""
+        return self.list_projects(archived=True)
 
     def get_project(self, project_id):
         connection = self.connect()
@@ -383,14 +456,72 @@ class Library:
         return None
 
     def update_project_favorite(self, project_id, favorite):
-        """Save a project's favorite flag without changing its order or papers."""
-        if not self.get_project(project_id):
+        """Move a project between ordered favorite and regular groups."""
+        project = self.get_project(project_id)
+        if not project:
             raise ValueError("Project not found")
+        if project.get("kind") == "scrapbook":
+            raise ValueError("ScrapBook cannot be favorited")
+        favorite = int(bool(favorite))
         connection = self.connect()
-        connection.execute(
-            "UPDATE projects SET favorite = ? WHERE id = ?",
-            (int(bool(favorite)), project_id),
+        if favorite and not project.get("favorite"):
+            favorite_position = project.get("favorite_position")
+            if favorite_position is None:
+                if project.get("kind") == "scrapbook":
+                    favorite_position = -1
+                else:
+                    row = connection.execute(
+                        "SELECT COALESCE(MAX(favorite_position), -1) + 1 "
+                        "FROM projects WHERE kind != 'scrapbook' AND archived = 0"
+                    ).fetchone()
+                    favorite_position = row[0]
+            connection.execute(
+                "UPDATE projects SET favorite = 1, favorite_position = ? "
+                "WHERE id = ?",
+                (favorite_position, project_id),
+            )
+        else:
+            connection.execute(
+                "UPDATE projects SET favorite = ? WHERE id = ?",
+                (favorite, project_id),
+            )
+        connection.commit()
+        connection.close()
+
+    def reorder_projects(self, project_ids, favorite):
+        """Persist the standard-project order inside one sidebar group."""
+        favorite = int(bool(favorite))
+        connection = self.connect()
+        rows = connection.execute(
+            "SELECT id, favorite, position, favorite_position FROM projects "
+            "WHERE kind != 'scrapbook' AND archived = 0",
+        ).fetchall()
+        expected_ids = {
+            row["id"] for row in rows if int(bool(row["favorite"])) == favorite
+        }
+        ordered_ids = list(project_ids)
+        if len(ordered_ids) != len(set(ordered_ids)):
+            connection.close()
+            raise ValueError("Project order contains duplicates")
+        if set(ordered_ids) != expected_ids:
+            connection.close()
+            raise ValueError("Project order does not match the sidebar group")
+        column = "favorite_position"
+        if not favorite:
+            column = "position"
+        positions = sorted(
+            row[column]
+            for row in rows
+            if int(bool(row["favorite"])) == favorite
+            and row[column] is not None
         )
+        if len(positions) != len(ordered_ids):
+            positions = list(range(len(ordered_ids)))
+        for project_id, position in zip(ordered_ids, positions):
+            connection.execute(
+                "UPDATE projects SET " + column + " = ? WHERE id = ?",
+                (position, project_id),
+            )
         connection.commit()
         connection.close()
 
@@ -415,12 +546,16 @@ class Library:
             project = self.get_project(project_id)
             if not project:
                 raise ValueError("Project not found")
+            if project.get("archived"):
+                raise ValueError(
+                    "Restore the archived project before adding sources to it"
+                )
             validated.append(project_id)
             if project.get("kind") == "scrapbook":
                 scrapbook_selected = True
         if scrapbook_selected and len(validated) > 1:
             raise ValueError(
-                "ScrapBook must be the only destination for a paper"
+                "ScrapBook must be the only destination for a source"
             )
         return validated
 
@@ -513,13 +648,43 @@ class Library:
         if folder_path and os.path.isdir(folder_path):
             shutil.rmtree(folder_path)
 
-    def list_papers(self, project_id=None, query_text=""):
+    def archive_project(self, project_id):
+        """Hide a standard project without changing any of its contents."""
+        project = self.get_project(project_id)
+        if not project:
+            raise ValueError("Project not found")
+        if project.get("kind") == "scrapbook":
+            raise ValueError("The built-in ScrapBook cannot be archived")
+        connection = self.connect()
+        connection.execute(
+            "UPDATE projects SET archived = 1 WHERE id = ?",
+            (project_id,),
+        )
+        connection.commit()
+        connection.close()
+
+    def restore_project(self, project_id):
+        """Return an archived standard project to the active sidebar."""
+        project = self.get_project(project_id)
+        if not project:
+            raise ValueError("Project not found")
+        if not project.get("archived"):
+            return
+        connection = self.connect()
+        connection.execute(
+            "UPDATE projects SET archived = 0 WHERE id = ?",
+            (project_id,),
+        )
+        connection.commit()
+        connection.close()
+
+    def list_papers(self, project_id=None, query_text="", source_type=""):
         connection = self.connect()
         sql = """
             SELECT papers.*, projects.name AS project_name
             FROM papers
             JOIN projects ON projects.id = papers.project_id
-            WHERE 1 = 1
+            WHERE projects.archived = 0
             """
         values = []
 
@@ -532,10 +697,18 @@ class Library:
             search = "%" + query_text + "%"
             values.extend([search, search])
 
+        if source_type:
+            sql += " AND papers.source_type = ?"
+            values.append(source_type)
+
         sql += " ORDER BY papers.position IS NULL, papers.position, papers.created_at DESC"
         rows = connection.execute(sql, values).fetchall()
         connection.close()
         return [dict(row) for row in rows]
+
+    def list_sources(self, project_id=None, query_text="", source_type=""):
+        """Return all library source types through the backwards-compatible table."""
+        return self.list_papers(project_id, query_text, source_type)
 
     def get_paper(self, paper_id):
         connection = self.connect()
@@ -552,8 +725,17 @@ class Library:
         if row:
             paper = dict(row)
             paper["tags"] = self.list_paper_tags(paper_id)
+            try:
+                paper["source_metadata_data"] = json.loads(
+                    paper.get("source_metadata") or "{}"
+                )
+            except (TypeError, ValueError):
+                paper["source_metadata_data"] = {}
             return paper
         return None
+
+    def get_source(self, source_id):
+        return self.get_paper(source_id)
 
     def save_reader_state(self, paper_id, page, zoom):
         """Remember a zero-based PDF page, zoom choice, and last reading time."""
@@ -576,6 +758,21 @@ class Library:
         connection.commit()
         connection.close()
 
+    def update_reader_source(self, paper_id, source):
+        """Remember which successful generated Reader representation to reopen."""
+        if not self.get_paper(paper_id):
+            raise ValueError("Paper not found")
+        source = str(source or "")
+        if source not in ("", "pdf_preview", "pdf_full", "captured") and not source.startswith("arxiv:"):
+            raise ValueError("Unsupported Reader source")
+        connection = self.connect()
+        connection.execute(
+            "UPDATE papers SET reader_source = ? WHERE id = ?",
+            (source, paper_id),
+        )
+        connection.commit()
+        connection.close()
+
     def recent_reading_papers(self, limit=5):
         """Return recently read local PDFs whose copied files still exist."""
         connection = self.connect()
@@ -584,7 +781,8 @@ class Library:
             "papers.reader_zoom, papers.last_opened, papers.reading_status, "
             "papers.favorite, papers.file_path, projects.name AS project_name FROM papers "
             "JOIN projects ON projects.id = papers.project_id "
-            "WHERE papers.last_opened != '' AND papers.file_path != '' "
+            "WHERE projects.archived = 0 AND papers.last_opened != '' "
+            "AND papers.file_path != '' "
             "ORDER BY papers.last_opened DESC, papers.id DESC"
         ).fetchall()
         connection.close()
@@ -674,7 +872,10 @@ class Library:
         terms = re.findall(r'tag:"(?:\\.|[^"\\])*"|\S+', str(query or ""), re.IGNORECASE)
         if not terms:
             return []
-        columns = ("title", "authors", "abstract", "notes", "extracted_text")
+        columns = (
+            "title", "authors", "abstract", "notes", "extracted_text",
+            "canonical_url", "source_metadata",
+        )
         clauses = []
         values = []
         match_terms = []
@@ -723,7 +924,8 @@ class Library:
         connection = self.connect()
         rows = connection.execute(
             "SELECT papers.*, projects.name AS project_name FROM papers "
-            "JOIN projects ON projects.id = papers.project_id WHERE "
+            "JOIN projects ON projects.id = papers.project_id "
+            "WHERE projects.archived = 0 AND "
             + " AND ".join(clauses)
             + " ORDER BY papers.last_opened DESC, papers.title LIMIT ?",
             values + [limit],
@@ -767,6 +969,7 @@ class Library:
         candidate_external_id = normalize_paper_identifier(
             candidate.get("external_id", "")
         )
+        candidate_url = str(candidate.get("canonical_url") or "").strip().casefold().rstrip("/")
         candidate_title = normalize_paper_title(candidate.get("title", ""))
         duplicates = []
         for project_id in project_ids:
@@ -779,7 +982,10 @@ class Library:
                     paper.get("external_id", "")
                 )
                 paper_title = normalize_paper_title(paper.get("title", ""))
-                if candidate_doi and candidate_doi == paper_doi:
+                paper_url = str(paper.get("canonical_url") or "").strip().casefold().rstrip("/")
+                if candidate_url and candidate_url == paper_url:
+                    reason = "same source URL"
+                elif candidate_doi and candidate_doi == paper_doi:
                     reason = "same DOI"
                 elif (
                     candidate_external_id
@@ -796,6 +1002,321 @@ class Library:
                     duplicate["match_reason"] = reason
                     duplicates.append(duplicate)
         return duplicates
+
+    def store_source_capture(self, capture):
+        """Persist one immutable source capture and return its Reader path."""
+        identity = (
+            capture.get("canonical_url")
+            or capture.get("external_id")
+            or capture.get("title")
+            or "source"
+        )
+        url_digest = hashlib.sha256(
+            str(identity).encode("utf-8")
+        ).hexdigest()[:20]
+        cache_path = os.path.join(
+            self.path,
+            "source_cache",
+            url_digest,
+            capture_digest(capture),
+        )
+        os.makedirs(cache_path, exist_ok=True)
+        document_path = os.path.join(cache_path, "document.json")
+        if not os.path.isfile(document_path):
+            extension = str(capture.get("source_extension") or ".html").casefold()
+            if extension not in (".html", ".htm", ".md", ".markdown"):
+                extension = ".html"
+            source_path = os.path.join(cache_path, "source" + extension)
+            temporary_source = source_path + ".tmp"
+            with open(temporary_source, "wb") as handle:
+                handle.write(capture.get("source_html", b""))
+            os.replace(temporary_source, source_path)
+            interactive_html = capture.get("interactive_html", b"")
+            if interactive_html:
+                interactive_path = os.path.join(cache_path, "interactive.html")
+                temporary_interactive = interactive_path + ".tmp"
+                with open(temporary_interactive, "wb") as handle:
+                    handle.write(interactive_html)
+                os.replace(temporary_interactive, interactive_path)
+            for asset in capture.get("assets", []):
+                filename = safe_asset_name(asset.get("filename"))
+                if not filename:
+                    continue
+                asset_path = os.path.join(cache_path, filename)
+                temporary_asset = asset_path + ".tmp"
+                with open(temporary_asset, "wb") as handle:
+                    handle.write(asset.get("content", b""))
+                os.replace(temporary_asset, asset_path)
+            temporary_document = document_path + ".tmp"
+            with open(temporary_document, "w", encoding="utf-8") as handle:
+                json.dump(capture["document"], handle, ensure_ascii=False, indent=2)
+            os.replace(temporary_document, document_path)
+        return document_path
+
+    def create_source_from_capture(self, project_id, capture, content_path=""):
+        """Save a confirmed article, repository, or local document."""
+        project = self.get_project(project_id)
+        if not project:
+            raise ValueError("Project not found")
+        source_type = str(capture.get("source_type") or "")
+        if source_type not in ("article", "github_repository", "document"):
+            raise ValueError("Unsupported captured source type")
+        title = str(capture.get("title") or "").strip()
+        if not title:
+            raise ValueError("Captured source has no title")
+        if not content_path:
+            content_path = self.store_source_capture(capture)
+        connection = self.connect()
+        position_row = connection.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM papers WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        created_at = datetime.now(timezone.utc).isoformat()
+        cursor = connection.execute(
+            """
+            INSERT INTO papers (
+                project_id, title, authors, conference, year, abstract,
+                external_id, external_url, metadata_source, extracted_text,
+                file_path, reader_source, source_type, canonical_url,
+                source_metadata, content_path, position, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 'captured', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                title,
+                str(capture.get("authors") or ""),
+                str(capture.get("venue") or ""),
+                capture.get("year"),
+                str(capture.get("abstract") or ""),
+                str(capture.get("external_id") or ""),
+                str(capture.get("external_url") or capture.get("canonical_url") or ""),
+                str(capture.get("source") or ""),
+                str(capture.get("extracted_text") or ""),
+                source_type,
+                str(capture.get("canonical_url") or ""),
+                json.dumps(capture.get("source_metadata") or {}, ensure_ascii=False),
+                content_path,
+                position_row[0],
+                created_at,
+            ),
+        )
+        connection.commit()
+        source_id = cursor.lastrowid
+        connection.close()
+        if source_type == "document":
+            try:
+                self.create_initial_document_version(
+                    source_id, capture, content_path
+                )
+            except Exception:
+                self.delete_paper(source_id)
+                raise
+        return self.get_source(source_id)
+
+    def create_source_copies(self, project_ids, capture):
+        """Create independent project records that share one immutable web snapshot."""
+        project_ids = self.validate_destination_projects(project_ids)
+        content_path = self.store_source_capture(capture)
+        sources = []
+        try:
+            for project_id in project_ids:
+                sources.append(
+                    self.create_source_from_capture(project_id, capture, content_path)
+                )
+        except Exception:
+            for source in sources:
+                self.delete_paper(source["id"])
+            raise
+        return sources
+
+    def create_initial_document_version(self, paper_id, capture, content_path):
+        """Attach version one to a newly created local document record."""
+        original_path, interactive_path = stored_capture_paths(
+            content_path, capture
+        )
+        metadata = capture.get("source_metadata") or {}
+        connection = self.connect()
+        cursor = connection.execute(
+            """
+            INSERT INTO source_versions (
+                paper_id, version_number, title, abstract, source_format,
+                original_filename, content_hash, original_path,
+                interactive_path, document_path, extracted_text,
+                source_metadata, created_at
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                paper_id,
+                str(capture.get("title") or "Untitled document"),
+                str(capture.get("abstract") or ""),
+                str(metadata.get("source_format") or "html"),
+                str(metadata.get("original_filename") or os.path.basename(original_path)),
+                str(capture.get("content_hash") or capture_digest(capture)),
+                original_path,
+                interactive_path,
+                content_path,
+                str(capture.get("extracted_text") or ""),
+                json.dumps(metadata, ensure_ascii=False),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        connection.execute(
+            "UPDATE papers SET current_version_id = ? WHERE id = ?",
+            (cursor.lastrowid, paper_id),
+        )
+        connection.commit()
+        connection.close()
+
+    def list_document_versions(self, paper_id):
+        """Return every immutable revision, newest first."""
+        connection = self.connect()
+        rows = connection.execute(
+            "SELECT source_versions.*, "
+            "CASE WHEN papers.current_version_id = source_versions.id "
+            "THEN 1 ELSE 0 END AS is_current "
+            "FROM source_versions JOIN papers ON papers.id = source_versions.paper_id "
+            "WHERE source_versions.paper_id = ? "
+            "ORDER BY source_versions.version_number DESC",
+            (paper_id,),
+        ).fetchall()
+        connection.close()
+        return [dict(row) for row in rows]
+
+    def get_document_version(self, paper_id, version_id=None):
+        """Return one revision or the document's active revision."""
+        connection = self.connect()
+        if version_id is None:
+            row = connection.execute(
+                "SELECT source_versions.* FROM source_versions "
+                "JOIN papers ON papers.current_version_id = source_versions.id "
+                "WHERE papers.id = ?",
+                (paper_id,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT * FROM source_versions WHERE paper_id = ? AND id = ?",
+                (paper_id, version_id),
+            ).fetchone()
+        connection.close()
+        if row:
+            return dict(row)
+        return None
+
+    def add_document_revision(self, paper_id, capture):
+        """Archive a new immutable revision and make it the active version."""
+        paper = self.get_paper(paper_id)
+        if not paper or paper.get("source_type") != "document":
+            raise ValueError("Select a local document before adding a revision")
+        if capture.get("source_type") != "document":
+            raise ValueError("The revision must be an HTML or Markdown document")
+        content_hash = str(capture.get("content_hash") or capture_digest(capture))
+        connection = self.connect()
+        duplicate = connection.execute(
+            "SELECT version_number FROM source_versions "
+            "WHERE paper_id = ? AND content_hash = ?",
+            (paper_id, content_hash),
+        ).fetchone()
+        if duplicate:
+            connection.close()
+            raise ValueError(
+                "This exact content is already saved as version "
+                + str(duplicate["version_number"])
+            )
+        connection.close()
+
+        content_path = self.store_source_capture(capture)
+        original_path, interactive_path = stored_capture_paths(
+            content_path, capture
+        )
+        metadata = capture.get("source_metadata") or {}
+        connection = self.connect()
+        row = connection.execute(
+            "SELECT COALESCE(MAX(version_number), 0) + 1 "
+            "FROM source_versions WHERE paper_id = ?",
+            (paper_id,),
+        ).fetchone()
+        version_number = row[0]
+        created_at = datetime.now(timezone.utc).isoformat()
+        cursor = connection.execute(
+            """
+            INSERT INTO source_versions (
+                paper_id, version_number, title, abstract, source_format,
+                original_filename, content_hash, original_path,
+                interactive_path, document_path, extracted_text,
+                source_metadata, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                paper_id,
+                version_number,
+                str(capture.get("title") or paper.get("title") or "Untitled document"),
+                str(capture.get("abstract") or ""),
+                str(metadata.get("source_format") or "html"),
+                str(metadata.get("original_filename") or os.path.basename(original_path)),
+                content_hash,
+                original_path,
+                interactive_path,
+                content_path,
+                str(capture.get("extracted_text") or ""),
+                json.dumps(metadata, ensure_ascii=False),
+                created_at,
+            ),
+        )
+        version_id = cursor.lastrowid
+        connection.execute(
+            """
+            UPDATE papers SET title = ?, abstract = ?, conference = ?,
+                external_id = ?, metadata_source = ?, extracted_text = ?,
+                source_metadata = ?, content_path = ?, current_version_id = ?
+            WHERE id = ?
+            """,
+            (
+                str(capture.get("title") or paper.get("title") or "Untitled document"),
+                str(capture.get("abstract") or ""),
+                str(capture.get("venue") or "Local document"),
+                str(capture.get("external_id") or ""),
+                str(capture.get("source") or "Local document"),
+                str(capture.get("extracted_text") or ""),
+                json.dumps(metadata, ensure_ascii=False),
+                content_path,
+                version_id,
+                paper_id,
+            ),
+        )
+        connection.commit()
+        connection.close()
+        return self.get_document_version(paper_id, version_id)
+
+    def activate_document_version(self, paper_id, version_id):
+        """Make one archived revision active without deleting newer history."""
+        paper = self.get_paper(paper_id)
+        version = self.get_document_version(paper_id, version_id)
+        if not paper or paper.get("source_type") != "document" or not version:
+            raise ValueError("Document version not found")
+        connection = self.connect()
+        connection.execute(
+            """
+            UPDATE papers SET title = ?, abstract = ?, conference = ?,
+                external_id = ?, metadata_source = ?, extracted_text = ?,
+                source_metadata = ?, content_path = ?, current_version_id = ?
+            WHERE id = ?
+            """,
+            (
+                version["title"],
+                version["abstract"],
+                "Local " + version["source_format"].title(),
+                version["content_hash"],
+                "Local " + version["source_format"].title(),
+                version["extracted_text"],
+                version["source_metadata"],
+                version["document_path"],
+                version["id"],
+                paper_id,
+            ),
+        )
+        connection.commit()
+        connection.close()
+        return self.get_paper(paper_id)
 
     def find_pdf_duplicates(self, project_ids, source_path):
         """Extract lightweight PDF metadata and find destination duplicates."""
@@ -1050,7 +1571,7 @@ class Library:
         if not project:
             raise ValueError("Project not found")
         if project.get("kind") == "scrapbook":
-            raise ValueError("Papers cannot be copied into ScrapBook")
+            raise ValueError("Sources cannot be copied into ScrapBook")
 
         destination = ""
         source_path = paper.get("file_path", "")
@@ -1078,10 +1599,10 @@ class Library:
                     summary, task, methodology, datasets, metrics, abstract,
                     doi, external_id, external_url, project_url, pdf_url,
                     metadata_source, citation_count, extracted_text, file_path,
-                    scholar_id, position, created_at
+                    scholar_id, reader_source, position, created_at
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -1108,14 +1629,25 @@ class Library:
                     paper.get("extracted_text", ""),
                     destination,
                     paper.get("scholar_id", ""),
+                    paper.get("reader_source", ""),
                     position_row[0],
                     created_at,
                 ),
             )
             copied_paper_id = cursor.lastrowid
             connection.execute(
-                "UPDATE papers SET reading_status = ?, favorite = ? WHERE id = ?",
-                (paper.get("reading_status", "unread"), paper.get("favorite", 0), copied_paper_id),
+                "UPDATE papers SET reading_status = ?, favorite = ?, "
+                "source_type = ?, canonical_url = ?, source_metadata = ?, "
+                "content_path = ? WHERE id = ?",
+                (
+                    paper.get("reading_status", "unread"),
+                    paper.get("favorite", 0),
+                    paper.get("source_type", "paper"),
+                    paper.get("canonical_url", ""),
+                    paper.get("source_metadata", "{}"),
+                    paper.get("content_path", ""),
+                    copied_paper_id,
+                ),
             )
             connection.execute(
                 """
@@ -1135,6 +1667,46 @@ class Library:
                 """,
                 (copied_paper_id, paper_id),
             )
+            if paper.get("source_type") == "document":
+                versions = connection.execute(
+                    "SELECT * FROM source_versions WHERE paper_id = ? "
+                    "ORDER BY version_number",
+                    (paper_id,),
+                ).fetchall()
+                copied_current_version_id = None
+                for version in versions:
+                    version_cursor = connection.execute(
+                        """
+                        INSERT INTO source_versions (
+                            paper_id, version_number, title, abstract,
+                            source_format, original_filename, content_hash,
+                            original_path, interactive_path, document_path,
+                            extracted_text, source_metadata, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            copied_paper_id,
+                            version["version_number"],
+                            version["title"],
+                            version["abstract"],
+                            version["source_format"],
+                            version["original_filename"],
+                            version["content_hash"],
+                            version["original_path"],
+                            version["interactive_path"],
+                            version["document_path"],
+                            version["extracted_text"],
+                            version["source_metadata"],
+                            version["created_at"],
+                        ),
+                    )
+                    if version["id"] == paper.get("current_version_id"):
+                        copied_current_version_id = version_cursor.lastrowid
+                if copied_current_version_id is not None:
+                    connection.execute(
+                        "UPDATE papers SET current_version_id = ? WHERE id = ?",
+                        (copied_current_version_id, copied_paper_id),
+                    )
             connection.commit()
         except Exception:
             connection.rollback()

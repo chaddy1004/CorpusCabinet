@@ -9,7 +9,10 @@ or local web server.
 
 - Native PySide6/Qt desktop window
 - Local library and workspace persistence
-- Project creation, renaming, deletion, and paper counts
+- Project creation, renaming, deletion, favorite grouping, persistent drag
+  ordering, and research-source counts
+- A blue temporary ScrapBook that stays above projects and disappears from the
+  sidebar whenever its staging area is empty
 - Multi-PDF import with safe copied filenames
 - Title and author metadata extraction from PDFs
 - Bounded extracted text stored for future AI assistance
@@ -26,11 +29,18 @@ or local web server.
 - Confirmed metadata application and citation-only paper records
 - Background download and import of direct open-access PDF links
 - Google Scholar browser handoff for manual Scholar searching
+- General research sources alongside papers, with project-level type filtering
+- Reviewed public article capture with readable text, bounded images, original
+  HTML, canonical URL duplicate checks, and persistent offline Reader snapshots
+- Reviewed GitHub repository capture with an offline, searchable README Reader
+  view and a link back to the full repository
+- Local HTML and Markdown archival with exact originals, offline Reader copies,
+  isolated interactive HTML, and immutable revision history with text comparison
 - A provider-independent `AssistantEngine` foundation for future paper chat
 
-The AI reading assistant, retrieval from sources without a direct open-access
-PDF, tagging, citation management, and synchronization are planned follow-up
-milestones. The old FastAPI/browser
+The AI reading assistant, citation management, synchronization, YouTube
+transcripts, and full repository code indexing are planned follow-up milestones.
+The old FastAPI/browser
 prototype remains in the repository as reference code but is not the desktop
 launch path.
 
@@ -66,7 +76,7 @@ platform's application-data directory.
 
 ## Online search and Offline Mode
 
-Use **+ Add paper** in the currently selected project's Papers pane to upload
+Use **+ Add source** in the currently selected project's Sources pane to upload
 PDFs or search online by title or paper link. The app searches Crossref, arXiv,
 and OpenAlex in the background. It combines duplicate records and shows the
 title, authors, venue, year, DOI, abstract, and available links for confirmation.
@@ -87,6 +97,50 @@ session. The toggle is persisted in the workspace registry. While it is on,
 the online search and external-link actions are disabled, but projects, local
 search, PDFs, citation-only records, and AI context preparation continue to
 work. Search results are never accepted or written automatically.
+
+## Articles and GitHub repositories
+
+Use **+ Add source → Save a website or GitHub repository…** in the selected
+project. Paste a public HTTP(S) URL, inspect the extracted title, creator, source
+type, and readable content, then choose the destination projects. Nothing is
+saved before this confirmation. ScrapBook remains an exclusive temporary
+destination, while standard projects receive independent records.
+
+Ordinary articles keep an immutable original HTML snapshot, readable ordered
+blocks, canonical URL, bounded offline images, and searchable text. GitHub
+repository roots keep a searchable offline snapshot of the README and a link
+back to the original repository. Detailed repository information stays on
+GitHub instead of being duplicated in Corpus Cabinet. Both reopen in the
+comfortable Reader without internet access. **Open
+original article** or **Open repository** returns to the live source when online.
+Corpus Cabinet does not bypass authentication, paywalls, or access controls;
+JavaScript-only pages may not expose enough readable content to capture.
+
+Use the source-type menu above a project's list to show all sources, papers,
+articles, or GitHub repositories. Library search indexes article text, README
+content, source metadata, notes, and tags alongside existing paper fields.
+
+## Local HTML and Markdown documents
+
+Use **+ Add source → Add HTML or Markdown from computer…** to archive `.html`,
+`.htm`, `.md`, or `.markdown` files. Corpus Cabinet keeps the exact original,
+creates a searchable Reader version, and packages local images, stylesheets, and
+scripts referenced with relative paths. Self-contained HTML widgets remain
+interactive in **Original**, but the archived page cannot use the network or
+read files outside its saved bundle. Markdown opens as its exact source text in
+that tab.
+
+You can also drag PDFs, HTML files, and Markdown files directly onto the current
+project's Sources pane. The open project is selected by default, and the same
+confirmation lets you add independent copies to other projects. Mixed drops are
+supported.
+
+Use **Versions → Add revision…** when an agent or collaborator produces an
+updated document. Every revision is immutable. The newest import becomes the
+current Reader version, any prior revision can be made current again, and any
+two revisions can be compared as a readable text diff. Document notes, tags,
+project membership, and version history remain attached to the same library
+record. Importing identical content twice is rejected.
 
 ## Reading and research workflow
 
@@ -126,6 +180,63 @@ your-library/
 
 The workspace registry is stored in the platform application-config directory.
 The library itself remains an ordinary folder that can be backed up or moved.
+
+## Experimental comfortable Reader
+
+The **Reader** tab first checks for an exact-title official arXiv record and uses
+arXiv HTML when available. Known arXiv identifiers are used directly; other
+papers require an exact normalized title match before Corpus Cabinet accepts the
+record. This prevents a similar paper from being silently substituted. If HTML
+is unavailable—or while offline—Reader can generate a three-page local PDF
+preview before deciding whether to convert the full paper. Reader
+reflows text into one column with adjustable text size and spacing, and preserves
+detected figures, tables, and equations as original PDF crops. Click a visual to
+expand it, or **Original · p. …** to check a block in the PDF. Internal citation
+links open large selectable destination text with a focused original crop, without
+changing your PDF reading position. These previews show extracted source context,
+not automatically verified reference entries. Some citation labels cannot be
+linked inline; use their Preview action. **Compare with PDF** opens an adjustable
+side-by-side debugging view; source links then navigate that comparison PDF while
+leaving Reader open. **Use OpenDyslexic** applies the same saved accessibility
+preference to both abstracts and Reader body text while keeping mathematical
+symbols in a dedicated serif face. Official arXiv MathML is converted into
+readable inline notation and standalone equations instead of exposed TeX commands.
+
+This is opt-in and **not a guaranteed lossless conversion**. Reading order,
+captions, inline mathematics, missed visual regions, and missing content need
+checking against the original. Scanned PDFs are not supported in this trial
+(OCR is disabled). The original PDF is never modified, and conversion does not
+upload PDFs, download models, or require internet access.
+
+Optional setup (installs dependencies and downloads a model, so obtain permission
+before running it on someone else's machine):
+
+```bash
+uv sync --extra reader
+uv run --extra reader docling-tools models download layout -o .reader_models
+uv run --extra reader run_desktop.py
+```
+
+`./run.sh` preserves the dependencies in an existing virtual environment.
+Use `--extra reader` when launching directly through uv; plain `uv run` may
+remove optional dependencies. `CORPUS_READER_MODELS` can point to a prefetched
+model directory instead. Model files are ignored by Git. Settings live in
+`src/corpus_cabinet/configs/config.yaml`; conversion is CPU-only with two threads,
+a time limit, and file/page limits. Cancel stops the conversion subprocess.
+
+The canonical Reader cache is a versioned `document.json`: ordered blocks such
+as headings, paragraphs, captions, figures, tables, formulas, and references,
+plus provenance, internal destinations, warnings, and its source engine. It is
+not a flattened Markdown file. PDF conversions keep raster crops beside that
+JSON. arXiv conversions also keep the exact downloaded `source.html` and cached
+raster figure files. Caches live under `<library>/reader_cache/`; PDF cache keys
+include the PDF SHA-256 and conversion settings, while arXiv cache keys include
+the arXiv ID and HTML converter version. Preview and full PDF conversions have
+separate caches. The successful source key is saved on the paper, so switching
+papers or restarting the app reopens the generated view without reconverting;
+existing compatible caches are also detected. Original PDF page/zoom history is independent
+of Reader typography. This experimental Reader does not yet save its own scroll
+position or import publisher HTML outside arXiv.
 
 ## Architecture
 
