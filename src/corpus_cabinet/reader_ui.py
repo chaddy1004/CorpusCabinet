@@ -123,6 +123,30 @@ def reader_html(document, width, font_size, spacious, font_family=""):
     return "".join(parts)
 
 
+def run_reader_worker(source, arguments):
+    """Run one conversion request for the packaged application's worker mode."""
+    values = json.loads(arguments)
+    if source == "arxiv":
+        from corpus_cabinet.arxiv_reader import convert_arxiv_html
+
+        result = convert_arxiv_html(*values)
+    elif source == "pdf":
+        from corpus_cabinet.reader import convert_pdf
+
+        result = convert_pdf(*values)
+    else:
+        raise ValueError("Unknown Reader source: " + str(source))
+    print(json.dumps(result))
+    return 0
+
+
+def reader_process_command(source, command, arguments):
+    """Return a development or frozen-app command for an isolated conversion."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--reader-worker", source, arguments]
+    return [sys.executable, "-c", command, arguments]
+
+
 class ReaderSignals(QObject):
     finished = Signal(object)
     failed = Signal(object)
@@ -161,7 +185,7 @@ class ReaderTask(QRunnable):
                 args = json.dumps([self.library_path, self.paper["file_path"], config, self.full])
             if self.cancelled.is_set():
                 raise RuntimeError("Conversion cancelled. The original PDF is unchanged.")
-            process = subprocess.Popen([sys.executable, "-c", command, args], env=environment,
+            process = subprocess.Popen(reader_process_command(self.source, command, args), env=environment,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             deadline = time.monotonic() + config["timeout_seconds"]
             while True:
@@ -278,10 +302,10 @@ class ReaderPanel(QWidget):
         self.online = True
         self.document_data = None
         self.active_task = None
-        self.font_size = 16
+        self.font_size = 12
         self.spacious = True
         self.font_family = font_family
-        self.use_dyslexic = bool(dyslexic_enabled and font_family)
+        self.use_dyslexic = False
         self.preview_dialog = None
         self.thread_pool = QThreadPool.globalInstance()
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
@@ -311,13 +335,14 @@ class ReaderPanel(QWidget):
         self.smaller_button = QPushButton("A−")
         self.smaller_button.setToolTip("Smaller text")
         self.smaller_button.clicked.connect(self.smaller_text)
+        self.smaller_button.setEnabled(False)
         typography.addWidget(self.smaller_button)
         self.larger_button = QPushButton("A+")
         self.larger_button.setToolTip("Larger text")
         self.larger_button.clicked.connect(self.larger_text)
         typography.addWidget(self.larger_button)
-        self.spacing_button = QPushButton("Spacious")
-        self.spacing_button.setCheckable(True)
+        self.spacing_button = QCheckBox("Spacious")
+        self.spacing_button.setToolTip("Use more space between lines and paragraphs")
         self.spacing_button.setChecked(True)
         self.spacing_button.toggled.connect(self.change_spacing)
         typography.addWidget(self.spacing_button)
@@ -617,11 +642,17 @@ class ReaderPanel(QWidget):
 
     def smaller_text(self):
         self.font_size = max(12, self.font_size - 1)
+        self.update_font_buttons()
         self.render_document()
 
     def larger_text(self):
         self.font_size = min(26, self.font_size + 1)
+        self.update_font_buttons()
         self.render_document()
+
+    def update_font_buttons(self):
+        self.smaller_button.setEnabled(self.font_size > 12)
+        self.larger_button.setEnabled(self.font_size < 26)
 
     def change_spacing(self, enabled):
         self.spacious = enabled

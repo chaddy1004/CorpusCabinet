@@ -10,3 +10,5 @@ venv/
 env/
 .reader_models/
 tmp/pdfs/
+build/
+dist/

@@ -268,3 +268,16 @@ call the internet, SerpAPI, or an AI provider; provider responses are mocked.
 The production packaging path is `pyside6-deploy`/Nuitka, with builds made on
 native macOS, Windows, and Linux runners. The intended release artifacts are a
 signed/notarized macOS app, a signed Windows installer, and a Linux AppImage.
+
+The current Apple-silicon beta can be built locally with:
+
+```bash
+uv sync --extra reader --group dev
+./scripts/build_macos.sh
+```
+
+This creates `dist/CorpusCabinet-<version>-macos-arm64.dmg`. The DMG includes
+the Qt runtime, PDF and WebEngine support, Docling, and the prefetched offline
+Reader model. It is ad-hoc signed for beta sharing but is not Apple-notarized;
+testers should follow `BETA_INSTALL.md`. Libraries remain outside the app bundle,
+so replacing the application during an update does not remove user data.

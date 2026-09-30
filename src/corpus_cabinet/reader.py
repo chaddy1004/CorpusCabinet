@@ -11,6 +11,7 @@ import importlib.metadata
 import json
 import logging
 import os
+import sys
 import tempfile
 
 import pymupdf
@@ -36,6 +37,8 @@ def reader_models_directory(config):
     override = os.environ.get("CORPUS_READER_MODELS")
     if override:
         return os.path.abspath(override)
+    if getattr(sys, "frozen", False):
+        return os.path.join(sys._MEIPASS, config["models_directory"])
     root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     return os.path.join(root, config["models_directory"])
 

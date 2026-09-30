@@ -7,6 +7,7 @@ models or contact network services; real Docling quality is a separate trial.
 import json
 import os
 import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -18,9 +19,13 @@ from PySide6.QtWidgets import QApplication
 
 from corpus_cabinet.reader import (
     destination_preview, find_cached_pdf_document, normalize_document,
-    read_cached_document, reader_cache_path, source_links,
+    read_cached_document, reader_cache_path, reader_models_directory,
+    source_links,
 )
-from corpus_cabinet.reader_ui import ReaderPanel, ReaderTask, linked_text, reader_html
+from corpus_cabinet.reader_ui import (
+    ReaderPanel, ReaderTask, linked_text, reader_html, reader_process_command,
+    run_reader_worker,
+)
 from corpus_cabinet.storage import calculate_file_sha256
 
 
@@ -211,8 +216,13 @@ def test_reader_panel_restores_cache_compares_pdf_and_previews_without_navigatio
     application = application_fixture()
     path = str(tmp_path / "paper.pdf")
     create_pdf(path)
-    panel = ReaderPanel("OpenDyslexic")
+    panel = ReaderPanel("OpenDyslexic", True)
     assert not panel.convert_button.isEnabled()
+    assert panel.font_size == 12
+    assert not panel.smaller_button.isEnabled()
+    assert panel.spacing_button.isChecked()
+    assert not panel.use_dyslexic
+    assert not panel.dyslexic_toggle.isChecked()
     panel.set_context(str(tmp_path), {"id": 1, "file_path": path})
     revision = panel.revision
     panel.set_context(str(tmp_path), {"id": 2, "file_path": path})
@@ -230,7 +240,10 @@ def test_reader_panel_restores_cache_compares_pdf_and_previews_without_navigatio
     assert saved_sources == [(2, "pdf_preview")]
     assert panel.full_button.isEnabled()
     panel.larger_button.click()
-    assert panel.font_size == 17
+    assert panel.font_size == 13
+    assert panel.smaller_button.isEnabled()
+    panel.spacing_button.click()
+    assert not panel.spacious
     assert "We cite" in panel.browser.toPlainText()
     panel.dyslexic_toggle.click()
     assert panel.use_dyslexic
@@ -293,3 +306,29 @@ def test_conversion_subprocess_is_offline_and_can_be_cancelled(monkeypatch):
     cancelled.run()
     assert process.terminated
     assert "cancelled" in failures[0]["message"]
+
+
+def test_packaged_reader_uses_embedded_models_and_worker_mode(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", "/app/resources", raising=False)
+    monkeypatch.setattr(sys, "executable", "/Applications/Corpus Cabinet.app/Contents/MacOS/Corpus Cabinet")
+
+    assert reader_models_directory(config_fixture()) == "/app/resources/.reader_models"
+    command = reader_process_command("pdf", "development command", "arguments")
+    assert command == [
+        "/Applications/Corpus Cabinet.app/Contents/MacOS/Corpus Cabinet",
+        "--reader-worker",
+        "pdf",
+        "arguments",
+    ]
+
+
+def test_reader_worker_prints_conversion_result(monkeypatch, capsys):
+    result = {"engine": "Docling", "blocks": []}
+    conversion = Mock(return_value=result)
+    monkeypatch.setattr("corpus_cabinet.reader.convert_pdf", conversion)
+    arguments = json.dumps(["library", "paper.pdf", config_fixture(), False])
+
+    assert run_reader_worker("pdf", arguments) == 0
+    assert json.loads(capsys.readouterr().out) == result
+    conversion.assert_called_once()
