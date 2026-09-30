@@ -13,10 +13,11 @@ Apple-notarized.
 
 ## Keep your library through updates
 
-Corpus Cabinet stores the database, source files, PDFs, notes, and Reader cache
-in the library folder selected by the user, not inside the application bundle.
-To update, quit Corpus Cabinet and replace the old application in Applications
-with the newer one. Do not delete the selected library folder.
+Corpus Cabinet stores the database, source files, PDFs, notes, generated content,
+and any existing Reader cache in the library folder selected by the user, not
+inside the application bundle. To update, quit Corpus Cabinet and replace the
+old application in Applications with the newer one. Do not delete the selected
+library folder.
 
 The library is ordinary local data and should be backed up before beta testing.
 

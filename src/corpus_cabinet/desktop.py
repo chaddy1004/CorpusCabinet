@@ -111,6 +111,11 @@ from corpus_cabinet.web_sources import (
 )
 
 
+def experimental_reader_enabled():
+    value = os.environ.get("CORPUS_CABINET_READER", "")
+    return value.casefold() in {"1", "true", "yes", "on"}
+
+
 LATEX_SYMBOLS = {
     r"\alpha": "α",
     r"\beta": "β",
@@ -2921,6 +2926,7 @@ class MainWindow(QMainWindow):
         self.network_available = True
         self.network_information = None
         self.online_controls_busy = False
+        self.paper_reader_enabled = experimental_reader_enabled()
         self.dyslexic_font_enabled = (
             self.workspace_manager.is_dyslexic_font_enabled()
         )
@@ -3764,7 +3770,7 @@ class MainWindow(QMainWindow):
         self.reader_panel.dyslexicChanged.connect(
             self.toggle_reader_font
         )
-        self.detail_tabs.addTab(self.reader_panel, "Reader")
+        self.detail_tabs.addTab(self.reader_panel, "Content")
         self.interactive_document_panel = InteractiveDocumentPanel()
         self.detail_tabs.addTab(
             self.interactive_document_panel,
@@ -4050,13 +4056,20 @@ class MainWindow(QMainWindow):
             paper = None
             if self.current_paper_id is not None:
                 paper = self.library.get_paper(self.current_paper_id)
-            self.reader_panel.set_context(
-                self.library.path, paper, not self.offline_mode
-            )
+            self.update_reader_context(paper)
         if self.current_paper_id is not None:
             paper = self.library.get_paper(self.current_paper_id)
             if paper and not paper.get("file_path"):
                 self.render_pdf_state(paper)
+
+    def update_reader_context(self, paper):
+        reader_paper = paper
+        if (paper and (paper.get("source_type") or "paper") == "paper"
+                and not self.paper_reader_enabled):
+            reader_paper = None
+        self.reader_panel.set_context(
+            self.library.path, reader_paper, not self.offline_mode
+        )
 
     def toggle_offline_mode(self, enabled):
         self.user_offline_mode = bool(enabled)
@@ -4618,9 +4631,14 @@ class MainWindow(QMainWindow):
         self.detail_tabs.setTabVisible(
             self.detail_tabs.indexOf(self.document_versions_panel), False
         )
+        reader_index = self.detail_tabs.indexOf(self.reader_panel)
+        self.detail_tabs.setTabText(reader_index, "Reader")
+        self.detail_tabs.setTabVisible(
+            reader_index, self.paper_reader_enabled
+        )
         self.update_paper_link_controls(None)
         self.render_pdf_state()
-        self.reader_panel.set_context(self.library.path, None, not self.offline_mode)
+        self.update_reader_context(None)
         self.interactive_document_panel.set_context(self.library, None)
         self.document_versions_panel.set_context(self.library, None)
 
@@ -4715,10 +4733,22 @@ class MainWindow(QMainWindow):
             self.detail_tabs.indexOf(self.document_versions_panel),
             is_document,
         )
+        reader_index = self.detail_tabs.indexOf(self.reader_panel)
+        if is_paper:
+            self.detail_tabs.setTabText(reader_index, "Reader")
+            self.detail_tabs.setTabVisible(
+                reader_index, self.paper_reader_enabled
+            )
+        else:
+            self.detail_tabs.setTabText(reader_index, "Content")
+            self.detail_tabs.setTabVisible(reader_index, True)
+        if (is_paper and not self.paper_reader_enabled
+                and self.detail_tabs.currentWidget() == self.reader_panel):
+            self.detail_tabs.setCurrentIndex(0)
         if not is_paper and self.detail_tabs.currentWidget() == self.pdf_tab:
             self.detail_tabs.setCurrentWidget(self.reader_panel)
         self.render_pdf_state(paper if is_paper else None)
-        self.reader_panel.set_context(self.library.path, paper, not self.offline_mode)
+        self.update_reader_context(paper)
         self.interactive_document_panel.set_context(self.library, paper)
         self.document_versions_panel.set_context(self.library, paper)
         self.update_paper_link_controls(paper)

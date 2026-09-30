@@ -43,6 +43,7 @@ from corpus_cabinet.desktop import (
     application_logo_path,
     apply_light_theme,
     comfortable_abstract_html,
+    experimental_reader_enabled,
     latex_to_html,
     latex_to_plain_text,
     local_source_paths_from_mime_data,
@@ -133,6 +134,13 @@ def create_article_capture():
             ],
         },
     }
+
+
+def test_experimental_reader_requires_explicit_opt_in(monkeypatch):
+    monkeypatch.delenv("CORPUS_CABINET_READER", raising=False)
+    assert experimental_reader_enabled() is False
+    monkeypatch.setenv("CORPUS_CABINET_READER", "true")
+    assert experimental_reader_enabled() is True
 
 
 def copy_download_fixture(url, destination, config):
@@ -563,6 +571,9 @@ def test_main_window_displays_imported_paper(tmp_path):
     assert window.copy_paper_button.text() == "Copy to project…"
     assert window.copy_paper_button.isEnabled() is True
     assert [window.detail_tabs.tabText(index) for index in range(3)] == ["Details", "PDF", "Notes"]
+    assert window.detail_tabs.isTabVisible(
+        window.detail_tabs.indexOf(window.reader_panel)
+    ) is False
     assert window.notes_editor.isEnabled() is True
     assert window.pdf_comments_panel.isVisible() is False
 
@@ -740,6 +751,12 @@ def test_saved_article_uses_reader_hides_paper_actions_and_filters_by_type(tmp_p
     assert window.bibtex_button.isVisible() is False
     assert window.reader_panel.document_data["engine"] == "Web article"
     assert "testable advice" in window.reader_panel.browser.toPlainText()
+    assert window.detail_tabs.tabText(
+        window.detail_tabs.indexOf(window.reader_panel)
+    ) == "Content"
+    assert window.detail_tabs.isTabVisible(
+        window.detail_tabs.indexOf(window.reader_panel)
+    ) is True
     assert window.paper_list.item(0).data(
         Qt.ItemDataRole.UserRole + 1
     )["source_type"] == "article"
@@ -801,6 +818,9 @@ def test_saved_markdown_document_shows_reader_original_and_versions(tmp_path):
         window.interactive_document_panel.raw_text.toPlainText()
     )
     assert window.document_versions_panel.version_list.count() == 1
+    assert window.detail_tabs.tabText(
+        window.detail_tabs.indexOf(window.reader_panel)
+    ) == "Content"
     window.close()
 
 

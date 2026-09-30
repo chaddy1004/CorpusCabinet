@@ -6,9 +6,6 @@ project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 python_bin="$project_dir/.venv/bin/python"
 pyinstaller_bin="$project_dir/.venv/bin/pyinstaller"
 source_icon="$project_dir/src/corpus_cabinet/assets/logo.png"
-models_dir="$project_dir/.reader_models"
-docling_parse_dir="$($python_bin -c 'import os, docling_parse; print(os.path.dirname(docling_parse.__file__))')"
-torchvision_dir="$($python_bin -c 'import os, torchvision; print(os.path.dirname(torchvision.__file__))')"
 build_dir="$project_dir/build/macos"
 dist_dir="$project_dir/dist"
 app_path="$dist_dir/Corpus Cabinet.app"
@@ -16,7 +13,7 @@ bundle_id="com.corpuscabinet.app"
 export PYINSTALLER_CONFIG_DIR="$build_dir/cache"
 
 if [ ! -x "$python_bin" ] || [ ! -x "$pyinstaller_bin" ]; then
-    echo "Run 'uv sync --extra reader --group dev' before packaging." >&2
+    echo "Run 'uv sync --group dev' before packaging." >&2
     exit 1
 fi
 
@@ -25,12 +22,7 @@ if [ ! -f "$source_icon" ]; then
     exit 1
 fi
 
-if [ ! -d "$models_dir" ]; then
-    echo "The offline Reader models are missing: $models_dir" >&2
-    exit 1
-fi
-
-version="$($python_bin -c 'import importlib.metadata; print(importlib.metadata.version("corpus-cabinet"))')"
+version="$("$python_bin" -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$project_dir/pyproject.toml")"
 architecture="$(uname -m)"
 dmg_path="$dist_dir/CorpusCabinet-$version-macos-$architecture.dmg"
 temporary_dir="$(mktemp -d -t corpus-cabinet-package)"
@@ -53,22 +45,19 @@ mkdir -p "$build_dir" "$dist_dir" "$dmg_source"
     --paths "$project_dir/src" \
     --add-data "$project_dir/src/corpus_cabinet/assets:corpus_cabinet/assets" \
     --add-data "$project_dir/src/corpus_cabinet/configs:corpus_cabinet/configs" \
-    --add-data "$models_dir:.reader_models" \
-    --add-data "$docling_parse_dir/pdf_resources:docling_parse/pdf_resources" \
-    --add-binary "$torchvision_dir/_C_stable.so:torchvision" \
-    --add-binary "$torchvision_dir/image_stable.so:torchvision" \
-    --add-binary "$torchvision_dir/.dylibs:torchvision/.dylibs" \
-    --hidden-import docling.models.plugins.defaults \
-    --hidden-import docling.models.stages.layout.layout_model \
-    --hidden-import docling.models.stages.layout.layout_object_detection_model \
-    --hidden-import docling.experimental.models.table_crops_layout_model \
-    --hidden-import docling.models.inference_engines.object_detection.transformers_engine \
+    --exclude-module accelerate \
+    --exclude-module cv2 \
+    --exclude-module docling \
+    --exclude-module docling_core \
+    --exclude-module docling_parse \
+    --exclude-module pandas \
+    --exclude-module safetensors \
+    --exclude-module scipy \
+    --exclude-module tokenizers \
+    --exclude-module torch \
+    --exclude-module torchvision \
+    --exclude-module transformers \
     --copy-metadata corpus-cabinet \
-    --copy-metadata docling \
-    --copy-metadata docling-slim \
-    --copy-metadata docling-core \
-    --copy-metadata transformers \
-    --copy-metadata torch \
     --distpath "$dist_dir" \
     --workpath "$build_dir/work" \
     --specpath "$build_dir/spec" \

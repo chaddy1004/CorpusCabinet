@@ -183,6 +183,12 @@ The library itself remains an ordinary folder that can be backed up or moved.
 
 ## Experimental comfortable Reader
 
+The paper Reader remains experimental and is disabled in the distributed beta.
+Imported Markdown, HTML, websites, and GitHub READMEs still use the shared
+single-column **Content** view. Reader development can be enabled locally with
+`CORPUS_CABINET_READER=1`; beta packages deliberately omit its model and
+machine-learning runtime.
+
 The **Reader** tab first checks for an exact-title official arXiv record and uses
 arXiv HTML when available. Known arXiv identifiers are used directly; other
 papers require an exact normalized title match before Corpus Cabinet accepts the
@@ -214,7 +220,7 @@ before running it on someone else's machine):
 ```bash
 uv sync --extra reader
 uv run --extra reader docling-tools models download layout -o .reader_models
-uv run --extra reader run_desktop.py
+CORPUS_CABINET_READER=1 uv run --extra reader run_desktop.py
 ```
 
 `./run.sh` preserves the dependencies in an existing virtual environment.
@@ -272,12 +278,13 @@ signed/notarized macOS app, a signed Windows installer, and a Linux AppImage.
 The current Apple-silicon beta can be built locally with:
 
 ```bash
-uv sync --extra reader --group dev
+uv sync --group dev
 ./scripts/build_macos.sh
 ```
 
 This creates `dist/CorpusCabinet-<version>-macos-arm64.dmg`. The DMG includes
-the Qt runtime, PDF and WebEngine support, Docling, and the prefetched offline
-Reader model. It is ad-hoc signed for beta sharing but is not Apple-notarized;
-testers should follow `BETA_INSTALL.md`. Libraries remain outside the app bundle,
-so replacing the application during an update does not remove user data.
+the Qt runtime plus PDF and WebEngine support. The experimental paper Reader,
+Docling, PyTorch, Transformers, and offline layout models are intentionally
+excluded. It is ad-hoc signed for beta sharing but is not Apple-notarized;
+testers should follow `BETA_INSTALL.md`. Libraries remain outside the app
+bundle, so replacing the application during an update does not remove user data.
