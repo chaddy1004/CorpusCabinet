@@ -45,6 +45,10 @@ text and remain separate from individual paper notes.
 
 Add new proposals below, then promote them into priorities when agreed.
 
+- [ ] First-run interactive onboarding: a skippable guided walkthrough that
+  explains projects, adding or dropping sources, source organization, reading
+  controls, notes, tags, and where library data is stored. Make it replayable
+  later from the app so users are not forced to remember everything at launch.
 - [x] Favorite projects grouped above regular projects, with independent,
   persistent drag ordering and restoration of regular position when unfavorited.
 - [x] Keep the blue ScrapBook fixed at the top of the sidebar and hide it
