@@ -14,7 +14,12 @@ import sqlite3
 from datetime import datetime, timezone
 
 from corpus_cabinet.pdfs import extract_pdf_metadata, extract_pdf_text
-from corpus_cabinet.web_sources import capture_digest, safe_asset_name
+from corpus_cabinet.web_sources import (
+    capture_digest,
+    load_web_source_config,
+    safe_asset_name,
+    web_content_category,
+)
 
 
 def normalize_paper_identifier(value):
@@ -87,6 +92,42 @@ def library_match_excerpt(text, terms):
     if end < len(text):
         excerpt += "…"
     return excerpt
+
+
+def backfill_web_content_categories(connection):
+    """Classify web captures created before content categories were stored."""
+    limit = load_web_source_config()["max_html_bytes"]
+    rows = connection.execute(
+        "SELECT id, canonical_url, source_metadata, content_path "
+        "FROM papers WHERE source_type = 'article'"
+    ).fetchall()
+    for row in rows:
+        try:
+            metadata = json.loads(row["source_metadata"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        if metadata.get("content_category"):
+            continue
+        content = b""
+        content_path = row["content_path"] or ""
+        if content_path:
+            source_path = os.path.join(
+                os.path.dirname(content_path),
+                "source.html",
+            )
+            if os.path.isfile(source_path):
+                with open(source_path, "rb") as handle:
+                    content = handle.read(limit + 1)
+                if len(content) > limit:
+                    content = b""
+        metadata["content_category"] = web_content_category(
+            row["canonical_url"],
+            content,
+        )
+        connection.execute(
+            "UPDATE papers SET source_metadata = ? WHERE id = ?",
+            (json.dumps(metadata, ensure_ascii=False), row["id"]),
+        )
 
 
 class WorkspaceManager:
@@ -355,6 +396,7 @@ class Library:
             "UPDATE papers SET source_type = 'paper' "
             "WHERE source_type IS NULL OR source_type = ''"
         )
+        backfill_web_content_categories(connection)
         connection.execute(
             "UPDATE projects SET favorite_position = position "
             "WHERE favorite = 1 AND favorite_position IS NULL"

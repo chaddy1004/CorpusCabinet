@@ -13,6 +13,7 @@ from corpus_cabinet.web_sources import (
     canonicalize_source_url,
     capture_web_source,
     github_repository_identity,
+    web_content_category,
 )
 
 
@@ -79,6 +80,33 @@ def test_article_capture_preserves_readable_blocks_and_canonical_url():
     assert "bounded feedback" in capture["extracted_text"]
     assert "Unrelated navigation" not in capture["extracted_text"]
     assert capture["document"]["engine"] == "Web article"
+
+
+def test_research_project_page_is_captured_as_research_content():
+    html = b"""
+    <html><head><title>VidBot: Learning Generalizable 3D Actions</title></head>
+    <body><main>
+      <h1>VidBot: Learning Generalizable 3D Actions from In-the-Wild Videos</h1>
+      <p>Han Zhang, Zhi Chai, and collaborators. CVPR 2025.</p>
+      <h2>Abstract</h2>
+      <p>This research project studies reusable robot policies learned from video.</p>
+      <p><a href="https://arxiv.org/abs/2503.07135">Paper</a></p>
+      <h2>BibTeX</h2>
+      <pre>@inproceedings{vidbot2025, title={VidBot}}</pre>
+    </main></body></html>
+    """
+
+    def fake_get(url, headers=None, timeout=None):
+        return FakeResponse(url, html)
+
+    url = "https://hanzhic.github.io/vidbot-project/"
+    capture = capture_web_source(url, web_config(), fake_get)
+
+    assert web_content_category(url, html) == "research"
+    assert capture["source_type"] == "article"
+    assert capture["source_metadata"]["content_category"] == "research"
+    assert capture["source"] == "Research project page"
+    assert capture["document"]["engine"] == "Research project page"
 
 
 def test_github_capture_preserves_readme_and_repository_identity():

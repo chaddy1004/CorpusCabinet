@@ -99,6 +99,36 @@ def identify_source_type(url):
     return "article"
 
 
+def web_content_category(url, content):
+    """Distinguish research project pages from general web articles."""
+    hostname = (urlsplit(str(url or "")).hostname or "").casefold()
+    if hostname in {"arxiv.org", "www.arxiv.org", "openreview.net"}:
+        return "research"
+    if not content:
+        return "web"
+    soup = BeautifulSoup(content, "html.parser")
+    if soup.select_one('meta[name^="citation_"]'):
+        return "research"
+    headings = {
+        " ".join(heading.get_text(" ", strip=True).casefold().split())
+        for heading in soup.select("h1,h2,h3,h4")
+    }
+    has_abstract = "abstract" in headings
+    has_bibtex = "bibtex" in headings or bool(
+        re.search(r"@(article|inproceedings|conference|misc)\s*\{", soup.get_text(" "), re.I)
+    )
+    has_research_link = False
+    for link in soup.select("a[href]"):
+        target = urlsplit(urljoin(url, link.get("href", ""))).hostname or ""
+        target = target.casefold()
+        if target in {"arxiv.org", "www.arxiv.org", "openreview.net", "doi.org"}:
+            has_research_link = True
+            break
+    if has_abstract and (has_bibtex or has_research_link):
+        return "research"
+    return "web"
+
+
 def checked_response(response, max_bytes, expected_types=None):
     """Validate a bounded successful response before its content is parsed."""
     response.raise_for_status()
@@ -121,6 +151,15 @@ def meta_value(soup, *selectors):
         if value:
             return value
     return ""
+
+
+def meta_values(soup, selector):
+    values = []
+    for tag in soup.select(selector):
+        value = tag.get("content", "").strip()
+        if value and value not in values:
+            values.append(value)
+    return values
 
 
 def published_year(value):
@@ -286,6 +325,7 @@ def capture_article(url, config, get=requests.get):
         config["max_html_bytes"],
         {"text/html", "application/xhtml+xml"},
     )
+    category = web_content_category(response.url or url, content)
     soup = BeautifulSoup(content, "html.parser")
     for tag in soup.select("script,style,noscript,nav,header,footer,form,aside"):
         tag.decompose()
@@ -295,24 +335,41 @@ def capture_article(url, config, get=requests.get):
         candidate = canonicalize_source_url(urljoin(canonical, canonical_tag["href"]))
         if urlsplit(candidate).hostname == urlsplit(canonical).hostname:
             canonical = candidate
-    title = meta_value(soup, 'meta[property="og:title"]', 'meta[name="twitter:title"]')
+    title = meta_value(
+        soup,
+        'meta[name="citation_title"]',
+        'meta[property="og:title"]',
+        'meta[name="twitter:title"]',
+    )
     if not title and soup.title:
         title = soup.title.get_text(" ", strip=True)
     title = " ".join(title.split())
     if not title:
         raise SourceCaptureError("The page does not expose a readable title.")
-    author = meta_value(soup, 'meta[name="author"]', 'meta[property="article:author"]')
-    site_name = meta_value(soup, 'meta[property="og:site_name"]')
+    citation_authors = meta_values(soup, 'meta[name="citation_author"]')
+    if citation_authors:
+        author = ", ".join(citation_authors)
+    else:
+        author = meta_value(soup, 'meta[name="author"]', 'meta[property="article:author"]')
+    site_name = meta_value(
+        soup,
+        'meta[name="citation_conference_title"]',
+        'meta[name="citation_journal_title"]',
+        'meta[property="og:site_name"]',
+    )
     if not site_name:
         site_name = urlsplit(canonical).hostname.removeprefix("www.")
     published = meta_value(
         soup,
+        'meta[name="citation_publication_date"]',
+        'meta[name="citation_date"]',
         'meta[property="article:published_time"]',
         'meta[name="date"]',
         'meta[name="datePublished"]',
     )
     description = meta_value(
         soup,
+        'meta[name="citation_abstract"]',
         'meta[name="description"]',
         'meta[property="og:description"]',
     )
@@ -324,9 +381,15 @@ def capture_article(url, config, get=requests.get):
     if len(text) < config["minimum_text_characters"]:
         raise SourceCaptureError("The page did not expose enough readable article content.")
     assets = download_article_images(blocks, canonical, get, config)
+    if category == "research":
+        engine = "Research project page"
+        source = "Research project page"
+    else:
+        engine = "Web article"
+        source = "Web article"
     document = {
         "version": config["cache_version"],
-        "engine": "Web article",
+        "engine": engine,
         "title": title,
         "source_url": canonical,
         "partial": False,
@@ -342,11 +405,12 @@ def capture_article(url, config, get=requests.get):
         "abstract": description,
         "canonical_url": canonical,
         "external_url": canonical,
-        "source": "Web article",
+        "source": source,
         "extracted_text": text[:config["max_index_characters"]],
         "source_metadata": {
             "published": published,
             "site_name": site_name,
+            "content_category": category,
             "captured_at": datetime.now(timezone.utc).isoformat(),
         },
         "source_html": content,

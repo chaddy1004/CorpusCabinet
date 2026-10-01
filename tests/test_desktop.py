@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from corpus_cabinet.desktop import (
+    AddPaperDialog,
     ArchivedProjectsDialog,
     BibtexDialog,
     DiscoveryDialog,
@@ -48,7 +49,9 @@ from corpus_cabinet.desktop import (
     latex_to_plain_text,
     local_source_paths_from_mime_data,
     pdf_paths_from_mime_data,
+    pasted_link_kind,
     render_pdf_to_printer,
+    source_group_key,
 )
 from corpus_cabinet.local_documents import capture_local_document
 from corpus_cabinet.storage import Library, WorkspaceManager
@@ -741,7 +744,7 @@ def test_saved_article_uses_reader_hides_paper_actions_and_filters_by_type(tmp_p
     application.processEvents()
 
     assert window.detail_title.text() == "Readable Engineering Notes"
-    assert "Article" in window.detail_meta.text()
+    assert "Web page" in window.detail_meta.text()
     assert window.abstract_label.text() == "Summary"
     assert window.detail_tabs.isTabVisible(
         window.detail_tabs.indexOf(window.pdf_tab)
@@ -942,6 +945,55 @@ def test_source_capture_dialog_starts_unsaved_and_has_project_confirmation(tmp_p
     assert dialog.save_button.isEnabled() is False
     assert "github.com" in dialog.url_input.placeholderText()
     dialog.close()
+
+
+def test_add_source_dialog_unifies_links_files_and_separates_search(tmp_path):
+    application = QApplication.instance()
+    if application is None:
+        application = QApplication([])
+    dialog = AddPaperDialog(
+        None,
+        {"id": 3, "name": "Robotics"},
+        True,
+    )
+
+    assert dialog.drop_zone.parentWidget() is dialog.manual_card
+    assert dialog.online_button.parentWidget() is dialog.search_card
+    assert dialog.search_card is not dialog.manual_card
+
+    markdown_path = str(tmp_path / "notes.md")
+    html_path = str(tmp_path / "report.html")
+    dialog.choose_paths([markdown_path, html_path])
+    assert dialog.choice == "files"
+    assert dialog.paths == [markdown_path, html_path]
+    dialog.close()
+
+    link_dialog = AddPaperDialog(
+        None,
+        {"id": 3, "name": "Robotics"},
+        True,
+    )
+    link_dialog.url_input.setText("https://hanzhic.github.io/vidbot-project/")
+    link_dialog.review_url()
+    assert link_dialog.choice == "url"
+    assert link_dialog.url == "https://hanzhic.github.io/vidbot-project/"
+    link_dialog.close()
+
+
+def test_pasted_links_route_publications_and_web_captures():
+    assert pasted_link_kind("https://arxiv.org/abs/2503.07135") == "paper"
+    assert pasted_link_kind("https://doi.org/10.1000/example") == "paper"
+    assert pasted_link_kind("https://hanzhic.github.io/vidbot-project/") == "web"
+    assert pasted_link_kind("https://github.com/acme/robot-stack") == "web"
+
+
+def test_research_web_capture_uses_research_group():
+    source = {
+        "source_type": "article",
+        "source_metadata_data": {"content_category": "research"},
+    }
+
+    assert source_group_key(source) == "paper"
 
 
 def test_saved_citation_shows_contextual_pdf_actions(tmp_path):

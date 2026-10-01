@@ -125,6 +125,34 @@ def test_article_sources_migrate_copy_search_and_reopen_offline(tmp_path):
     assert copied["content_path"] == sources[0]["content_path"]
 
 
+def test_existing_research_project_page_is_backfilled_on_reopen(tmp_path):
+    root = str(tmp_path / "library")
+    library = Library(root)
+    project = library.create_project("Research")
+    capture = article_capture()
+    capture["canonical_url"] = "https://hanzhic.github.io/vidbot-project/"
+    capture["external_url"] = capture["canonical_url"]
+    capture["source_html"] = b"""
+    <main><h1>VidBot</h1><h2>Abstract</h2>
+    <p>A research project about reusable robot policies from video.</p>
+    <a href="https://arxiv.org/abs/2503.07135">Paper</a>
+    <h2>BibTeX</h2><pre>@inproceedings{vidbot2025}</pre></main>
+    """
+    source = library.create_source_from_capture(project["id"], capture)
+    connection = library.connect()
+    connection.execute(
+        "UPDATE papers SET source_metadata = '{}' WHERE id = ?",
+        (source["id"],),
+    )
+    connection.commit()
+    connection.close()
+
+    reopened = Library(root)
+    migrated = reopened.get_source(source["id"])
+
+    assert migrated["source_metadata_data"]["content_category"] == "research"
+
+
 def test_attach_pdf_to_saved_citation(tmp_path):
     root = str(tmp_path / "library")
     source_path = str(tmp_path / "attached.pdf")

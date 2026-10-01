@@ -14,7 +14,7 @@ import re
 import signal
 import sys
 import tempfile
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 
 from PySide6.QtCore import (
     QEvent,
@@ -101,6 +101,7 @@ from corpus_cabinet.research_ui import LibrarySearchDialog, ProjectNotesDialog
 from corpus_cabinet.reader_ui import ReaderPanel
 from corpus_cabinet.search import (
     OnlineSearchService,
+    arxiv_query_id,
     google_scholar_url,
     suggest_context_terms,
 )
@@ -160,13 +161,6 @@ READING_STATUS_COLORS = {
 }
 
 PROJECT_DRAG_MIME = "application/x-corpus-cabinet-project"
-
-SOURCE_TYPE_LABELS = {
-    "paper": "Paper",
-    "article": "Article",
-    "github_repository": "GitHub",
-    "document": "Document",
-}
 
 SOURCE_GROUPS = (
     ("paper", "Research papers"),
@@ -516,6 +510,9 @@ def source_group_key(paper):
     source_type = paper.get("source_type") or "paper"
     if source_type == "paper":
         return "paper"
+    if (source_type == "article"
+            and source_metadata(paper).get("content_category") == "research"):
+        return "paper"
     if source_type == "document":
         source_format = str(
             source_metadata(paper).get("source_format") or ""
@@ -535,6 +532,16 @@ def source_content_label(paper):
         "web": "Web page",
     }
     return labels[source_group_key(paper)]
+
+
+def pasted_link_kind(value):
+    """Route publication identifiers to search and other URLs to capture."""
+    if arxiv_query_id(value):
+        return "paper"
+    hostname = (urlsplit(str(value or "")).hostname or "").casefold()
+    if hostname in {"doi.org", "dx.doi.org"}:
+        return "paper"
+    return "web"
 
 
 def paper_card_label(paper):
@@ -1624,53 +1631,165 @@ class PdfDropPanel(QWidget):
         event.accept()
 
 
+class LocalSourceDropZone(QFrame):
+    """Accept any supported local source without asking for its format."""
+
+    sourcesDropped = Signal(object)
+    browseRequested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("addSourceDropZone")
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(118)
+        self.setStyleSheet(
+            "QFrame#addSourceDropZone { border: 2px dashed #C8C3D8; "
+            "border-radius: 10px; background: #FBFAFD; }"
+            "QFrame#addSourceDropZone[dragActive=true] { border-color: #6D57B5; "
+            "background: #F1EDFF; }"
+            "QLabel { border: 0; background: transparent; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(6)
+        title = QLabel("Drop files here")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("font-weight: 600;")
+        layout.addWidget(title)
+        formats = QLabel("PDF, HTML, or Markdown · formats are detected automatically")
+        formats.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        formats.setObjectName("mutedLabel")
+        layout.addWidget(formats)
+        browse_button = QPushButton("Choose files…")
+        browse_button.clicked.connect(self.browseRequested)
+        layout.addWidget(browse_button, alignment=Qt.AlignmentFlag.AlignCenter)
+
+    def set_drag_active(self, active):
+        self.setProperty("dragActive", bool(active))
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def dragEnterEvent(self, event):
+        paths = local_source_paths_from_mime_data(event.mimeData(), False)
+        if paths:
+            self.set_drag_active(True)
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        paths = local_source_paths_from_mime_data(event.mimeData(), False)
+        if paths:
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.set_drag_active(False)
+        event.accept()
+
+    def dropEvent(self, event):
+        paths = local_source_paths_from_mime_data(event.mimeData())
+        self.set_drag_active(False)
+        if not paths:
+            event.ignore()
+            return
+        self.sourcesDropped.emit(paths)
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+
+
 class AddPaperDialog(QDialog):
-    """Offer the supported ways to add a research source to one project."""
+    """Offer one manual add area and a separate online paper search."""
 
     def __init__(self, parent, project, online_enabled):
         super().__init__(parent)
         self.choice = ""
+        self.paths = []
+        self.url = ""
         self.setWindowTitle("Add source")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(570)
 
         layout = QVBoxLayout(self)
         heading = QLabel("Add a source to " + project["name"])
         heading.setObjectName("homeSectionHeading")
         layout.addWidget(heading)
         description = QLabel(
-            "Import a PDF or local document, find a publication online, or "
-            "save a useful article or GitHub repository."
+            "Add something you already have, or search research databases "
+            "for a publication."
         )
         description.setWordWrap(True)
         description.setObjectName("mutedLabel")
         layout.addWidget(description)
 
-        self.upload_button = QPushButton("Add PDF from computer…")
-        self.upload_button.setMinimumHeight(48)
-        self.upload_button.clicked.connect(self.choose_upload)
-        layout.addWidget(self.upload_button)
+        self.manual_card = QFrame()
+        self.manual_card.setObjectName("addSourceManualCard")
+        self.manual_card.setStyleSheet(
+            "QFrame#addSourceManualCard { border: 1px solid #D9DAE0; "
+            "border-radius: 11px; background: #FFFFFF; }"
+        )
+        manual_layout = QVBoxLayout(self.manual_card)
+        manual_layout.setContentsMargins(16, 14, 16, 16)
+        manual_heading = QLabel("Add something you already have")
+        manual_heading.setStyleSheet("font-size: 15px; font-weight: 600;")
+        manual_layout.addWidget(manual_heading)
+        manual_note = QLabel("Paste a public link or add files from your computer.")
+        manual_note.setObjectName("mutedLabel")
+        manual_layout.addWidget(manual_note)
+        url_layout = QHBoxLayout()
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText(
+            "Paste an arXiv, research project, article, or GitHub link"
+        )
+        self.url_input.setClearButtonEnabled(True)
+        self.url_input.setEnabled(online_enabled)
+        self.url_input.returnPressed.connect(self.review_url)
+        url_layout.addWidget(self.url_input, 1)
+        self.url_button = QPushButton("Review link")
+        self.url_button.setEnabled(online_enabled)
+        self.url_button.clicked.connect(self.review_url)
+        url_layout.addWidget(self.url_button)
+        manual_layout.addLayout(url_layout)
+        or_label = QLabel("or")
+        or_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        or_label.setObjectName("mutedLabel")
+        manual_layout.addWidget(or_label)
+        self.drop_zone = LocalSourceDropZone()
+        self.drop_zone.browseRequested.connect(self.choose_files)
+        self.drop_zone.sourcesDropped.connect(self.choose_paths)
+        manual_layout.addWidget(self.drop_zone)
+        layout.addWidget(self.manual_card)
 
-        self.document_button = QPushButton("Add HTML or Markdown from computer…")
-        self.document_button.setMinimumHeight(48)
-        self.document_button.clicked.connect(self.choose_document)
-        layout.addWidget(self.document_button)
-
+        self.search_card = QFrame()
+        self.search_card.setObjectName("addSourceSearchCard")
+        self.search_card.setStyleSheet(
+            "QFrame#addSourceSearchCard { border: 1px solid #D8D0F0; "
+            "border-radius: 11px; background: #F8F5FF; }"
+        )
+        search_layout = QVBoxLayout(self.search_card)
+        search_layout.setContentsMargins(16, 14, 16, 16)
+        search_heading = QLabel("Find a published paper")
+        search_heading.setStyleSheet("font-size: 15px; font-weight: 600;")
+        search_layout.addWidget(search_heading)
+        search_note = QLabel(
+            "Search Crossref, arXiv, and OpenAlex by title, DOI, or keywords."
+        )
+        search_note.setObjectName("mutedLabel")
+        search_note.setWordWrap(True)
+        search_layout.addWidget(search_note)
         self.online_button = QPushButton("Find a paper online…")
-        self.online_button.setMinimumHeight(48)
+        self.online_button.setMinimumHeight(42)
         self.online_button.setEnabled(online_enabled)
         self.online_button.clicked.connect(self.choose_online)
-        layout.addWidget(self.online_button)
-
-        self.web_button = QPushButton("Save a website or GitHub repository…")
-        self.web_button.setMinimumHeight(48)
-        self.web_button.setEnabled(online_enabled)
-        self.web_button.clicked.connect(self.choose_web)
-        layout.addWidget(self.web_button)
+        search_layout.addWidget(self.online_button)
+        layout.addWidget(self.search_card)
 
         if not online_enabled:
             offline_label = QLabel(
                 "Online search is unavailable right now. You can still add "
-                "a local PDF, HTML document, or Markdown document."
+                "PDF, HTML, or Markdown files."
             )
             offline_label.setObjectName("mutedLabel")
             offline_label.setWordWrap(True)
@@ -1680,22 +1799,34 @@ class AddPaperDialog(QDialog):
         cancel_button.clicked.connect(self.reject)
         layout.addWidget(cancel_button, alignment=Qt.AlignmentFlag.AlignRight)
 
-    def choose_upload(self):
-        self.choice = "upload"
+    def choose_files(self):
+        paths, ignored_filter = QFileDialog.getOpenFileNames(
+            self,
+            "Add sources",
+            "",
+            "Supported sources (*.pdf *.html *.htm *.md *.markdown)",
+        )
+        del ignored_filter
+        self.choose_paths(paths)
+
+    def choose_paths(self, paths):
+        if not paths:
+            return
+        self.paths = list(paths)
+        self.choice = "files"
+        self.accept()
+
+    def review_url(self):
+        url = self.url_input.text().strip()
+        if not url:
+            return
+        self.url = url
+        self.choice = "url"
         self.accept()
 
     def choose_online(self):
         self.choice = "online"
         self.accept()
-
-    def choose_document(self):
-        self.choice = "document"
-        self.accept()
-
-    def choose_web(self):
-        self.choice = "web"
-        self.accept()
-
 
 class ProjectSelectionDialog(QDialog):
     """Choose one or more destination projects with visible locked entries."""
@@ -1880,7 +2011,14 @@ class ArchivedProjectsDialog(QDialog):
 class SourceCaptureDialog(QDialog):
     """Inspect a public URL and save the confirmed offline snapshot."""
 
-    def __init__(self, parent, projects, project_id, save_callback):
+    def __init__(
+        self,
+        parent,
+        projects,
+        project_id,
+        save_callback,
+        initial_url="",
+    ):
         super().__init__(parent)
         self.projects = list(projects)
         self.project_id = project_id
@@ -1907,6 +2045,7 @@ class SourceCaptureDialog(QDialog):
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("https://example.com/article or https://github.com/owner/repository")
         self.url_input.setClearButtonEnabled(True)
+        self.url_input.setText(initial_url)
         self.url_input.returnPressed.connect(self.start_capture)
         url_layout.addWidget(self.url_input, 1)
         self.inspect_button = QPushButton("Inspect")
@@ -1948,6 +2087,8 @@ class SourceCaptureDialog(QDialog):
         close_button.clicked.connect(self.reject)
         actions.addWidget(close_button)
         layout.addLayout(actions)
+        if initial_url:
+            QTimer.singleShot(0, self.start_capture)
 
     def start_capture(self):
         url = self.url_input.text().strip()
@@ -4654,7 +4795,7 @@ class MainWindow(QMainWindow):
         metadata = []
         if paper.get("authors"):
             metadata.append(paper["authors"])
-        metadata.append(SOURCE_TYPE_LABELS.get(source_type, "Source"))
+        metadata.append(source_content_label(paper))
         if paper.get("conference"):
             if is_paper:
                 metadata.append("Published in " + paper["conference"])
@@ -5411,73 +5552,25 @@ class MainWindow(QMainWindow):
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        if dialog.choice == "upload":
-            self.choose_pdfs(project["id"])
-        elif dialog.choice == "document":
-            self.choose_local_document(project["id"])
+        if dialog.choice == "files":
+            self.confirm_sources_for_project(
+                dialog.paths,
+                project["id"],
+                "Add sources to projects",
+            )
+        elif dialog.choice == "url":
+            self.add_url_source(dialog.url, project["id"])
         elif dialog.choice == "online":
             self.discover_papers(project["id"])
-        elif dialog.choice == "web":
-            self.capture_web_source(project["id"])
 
-    def choose_local_document(self, project_id=None):
-        """Archive one local HTML or Markdown document in chosen projects."""
-        if project_id is None:
-            project_id = self.current_project_id
-        if project_id is None:
-            return
-        path, ignored_filter = QFileDialog.getOpenFileName(
-            self,
-            "Add HTML or Markdown",
-            "",
-            "Documents (*.html *.htm *.md *.markdown)",
-        )
-        del ignored_filter
-        if not path:
-            return
-        try:
-            capture = capture_local_document(path)
-        except (OSError, ValueError, RuntimeError) as error:
-            QMessageBox.warning(self, "Document could not be read", str(error))
-            return
-        metadata = capture.get("source_metadata") or {}
-        description = (
-            capture["title"] + "\n\n"
-            + metadata.get("source_format", "document").upper()
-            + " · " + str(len(capture.get("extracted_text", "")))
-            + " searchable characters"
-        )
-        if metadata.get("interactive"):
-            description += " · interactive widgets detected"
-        answer = QMessageBox.question(
-            self,
-            "Archive local document",
-            description + "\n\nArchive the exact original and create an offline Reader copy?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        projects = self.library.list_projects()
-        scrapbook_ids = []
-        for project in projects:
-            if project.get("kind") == "scrapbook":
-                scrapbook_ids.append(project["id"])
-        dialog = ProjectSelectionDialog(
-            self,
-            projects,
-            selected_ids=[project_id],
-            exclusive_ids=scrapbook_ids,
-            title="Add document to projects",
-            prompt=(
-                "Choose every project that should receive an independent "
-                "document record and revision history."
-            ),
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        self.save_web_source_capture(capture, dialog.selected_project_ids())
+    def add_url_source(self, url, project_id):
+        """Open the appropriate review flow for one pasted link."""
+        if pasted_link_kind(url) == "paper":
+            self.discover_papers(project_id, initial_query=url)
+        else:
+            self.capture_web_source(project_id, initial_url=url)
 
-    def capture_web_source(self, project_id=None):
+    def capture_web_source(self, project_id=None, initial_url=""):
         """Inspect and confirm a public article or GitHub repository URL."""
         if self.offline_mode:
             QMessageBox.information(
@@ -5495,6 +5588,7 @@ class MainWindow(QMainWindow):
             self.library.list_projects(),
             project_id,
             self.save_web_source_capture,
+            initial_url=initial_url,
         )
         dialog.exec()
 
@@ -5522,36 +5616,22 @@ class MainWindow(QMainWindow):
         )
         return True
 
-    def choose_pdfs(self, project_id=None):
-        """Choose local PDFs, then confirm all destination projects."""
-        if project_id is None:
-            project_id = self.current_project_id
-        if project_id is None:
-            return
-        paths, accepted = QFileDialog.getOpenFileNames(
-            self,
-            "Add PDFs",
-            "",
-            "PDF files (*.pdf)",
-        )
-        if not accepted or not paths:
-            return
-        self.confirm_pdf_destinations(
-            paths,
-            project_id,
-            "Add PDFs to projects",
-            (
-                "Choose every project that should receive an independent "
-                "record and PDF copy."
-            ),
-        )
-
     def confirm_dropped_sources(self, paths):
         """Confirm a Sources-pane drop and optionally add more destinations."""
         project_id = self.current_project_id
+        if project_id is None:
+            return
+        self.confirm_sources_for_project(
+            paths,
+            project_id,
+            "Add dropped sources",
+        )
+
+    def confirm_sources_for_project(self, paths, project_id, title):
+        """Describe mixed local sources and confirm their destinations."""
         project = self.library.get_project(project_id)
         if not project or not paths:
-            return
+            return False
         names = []
         for path in paths[:3]:
             names.append(os.path.basename(path))
@@ -5563,10 +5643,10 @@ class MainWindow(QMainWindow):
             + " is selected because it is open now. Choose any "
             "additional projects that should receive independent copies."
         )
-        self.confirm_local_source_destinations(
+        return self.confirm_local_source_destinations(
             paths,
             project_id,
-            "Add dropped sources",
+            title,
             prompt,
         )
 
@@ -5655,26 +5735,7 @@ class MainWindow(QMainWindow):
         )
         return True
 
-    def confirm_pdf_destinations(self, paths, project_id, title, prompt):
-        """Show the shared multi-project confirmation for local PDFs."""
-        projects = self.library.list_projects()
-        scrapbook_ids = []
-        for project in projects:
-            if project.get("kind") == "scrapbook":
-                scrapbook_ids.append(project["id"])
-        dialog = ProjectSelectionDialog(
-            self,
-            projects,
-            selected_ids=[project_id],
-            exclusive_ids=scrapbook_ids,
-            title=title,
-            prompt=prompt,
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return False
-        return self.start_import(paths, dialog.selected_project_ids())
-
-    def discover_papers(self, project_id=None):
+    def discover_papers(self, project_id=None, initial_query=""):
         """Search online with one project preselected as the destination."""
         if self.offline_mode:
             QMessageBox.information(
@@ -5699,6 +5760,7 @@ class MainWindow(QMainWindow):
             self.create_project_from_discovery,
             self.discovery_context,
             self.save_discovery_context,
+            initial_query=initial_query,
         )
         dialog.exec()
 
